@@ -21,23 +21,27 @@ samples_per_epoch: 6000
 num_workers: 4
 pin_mem: true
 
-# Conditional x-pred flow
+# JiT x-pred on a degradation-anchored ResShift bridge
 prediction_type: conditional_x
-P_mean: -0.8
-P_std: 0.8
-noise_scale: 1.0
-t_eps: 0.05
+bridge_type: resshift
 cond_drop_prob: 0.0
 lambda_flow: 1.0
 lambda_l1: 1.0
-generation_strength: 0.6
+resshift_steps: 15
+# Pixel tensors are in [-1, 1], so use a smaller perturbation than latent ResShift.
+resshift_kappa: 0.2
+resshift_schedule_power: 0.3
+resshift_eta_end: 0.999
 
 # Sampling and validation
-sampling_method: euler
-num_sampling_steps: 1
+sampling_method: resshift
+num_sampling_steps: 15
 eval_freq: 5
 num_eval_images: 4
 eval_seed: 1234
+diagnostic_steps: 1,4,15
+diagnostic_images: 2
+diagnostic_panel_size: 256
 
 # Optimization
 epochs: 100

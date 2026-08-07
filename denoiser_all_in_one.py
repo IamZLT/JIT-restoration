@@ -1,6 +1,7 @@
-"""Task-conditioned fixed-resolution JiT for All-in-One restoration."""
+"""Task-conditioned JiT with a ResShift-style restoration bridge."""
 
 import copy
+import math
 
 import torch
 import torch.nn as nn
@@ -22,32 +23,65 @@ class AllInOneRestorationDenoiser(nn.Module):
         )
         self.img_size = args.img_size
         self.num_classes = args.class_num
-        self.P_mean = args.P_mean
-        self.P_std = args.P_std
-        self.noise_scale = args.noise_scale
+        self.bridge_type = getattr(args, "bridge_type", "resshift")
         self.cond_drop_prob = getattr(args, "cond_drop_prob", 0.0)
         self.lambda_flow = getattr(args, "lambda_flow", 1.0)
         self.lambda_l1 = getattr(args, "lambda_l1", 1.0)
         self.prediction_type = args.prediction_type
-        self.generation_strength = args.generation_strength
-        self.t_eps = args.t_eps
+        self.resshift_steps = getattr(args, "resshift_steps", 15)
+        self.resshift_kappa = getattr(args, "resshift_kappa", 0.2)
+        self.resshift_schedule_power = getattr(
+            args,
+            "resshift_schedule_power",
+            0.3,
+        )
+        self.resshift_eta_end = getattr(args, "resshift_eta_end", 0.999)
         if self.prediction_type != "conditional_x":
             raise ValueError("All-in-One JiT requires conditional_x")
+        if self.bridge_type != "resshift":
+            raise ValueError("All-in-One JiT requires bridge_type=resshift")
         if self.num_classes < 3:
             raise ValueError("All-in-One JiT requires class_num >= 3")
-        if not 0.0 <= self.generation_strength <= 1.0:
-            raise ValueError("generation_strength must be in [0, 1]")
+        if self.resshift_steps < 1:
+            raise ValueError("resshift_steps must be positive")
+        if self.resshift_kappa <= 0:
+            raise ValueError("resshift_kappa must be positive")
+        if self.resshift_schedule_power <= 0:
+            raise ValueError("resshift_schedule_power must be positive")
+        if not 0.0 < self.resshift_eta_end < 1.0:
+            raise ValueError("resshift_eta_end must be in (0, 1)")
 
         self.ema_decay = args.ema_decay
         self.ema_params = None
         self.method = args.sampling_method
         self.steps = args.num_sampling_steps
 
-    def sample_t(self, count, device):
-        logits = (
-            torch.randn(count, device=device) * self.P_std + self.P_mean
+    def _eta_schedule(self, steps, device, dtype):
+        """Return [eta_0=0, eta_1, ..., eta_T] from ResShift."""
+        eta_start = min(
+            (0.04 / self.resshift_kappa) ** 2,
+            0.001,
         )
-        return torch.sigmoid(logits)
+        if steps == 1:
+            return torch.tensor(
+                [0.0, self.resshift_eta_end],
+                device=device,
+                dtype=dtype,
+            )
+        progress = torch.linspace(
+            0.0,
+            1.0,
+            steps,
+            device=device,
+            dtype=torch.float64,
+        )
+        log_eta = (
+            math.log(eta_start)
+            + progress.pow(self.resshift_schedule_power)
+            * (math.log(self.resshift_eta_end) - math.log(eta_start))
+        )
+        eta = log_eta.exp().to(dtype=dtype)
+        return torch.cat([eta.new_zeros(1), eta])
 
     def _maybe_drop_cond(self, condition):
         if not self.training or self.cond_drop_prob <= 0:
@@ -86,29 +120,43 @@ class AllInOneRestorationDenoiser(nn.Module):
                 f"Training patches must be {self.img_size}x{self.img_size}"
             )
         condition = self._maybe_drop_cond(degraded)
-        t = self.sample_t(clean.size(0), clean.device).view(
+        eta_schedule = self._eta_schedule(
+            self.resshift_steps,
+            clean.device,
+            clean.dtype,
+        )
+        step_indices = torch.randint(
+            1,
+            self.resshift_steps + 1,
+            (clean.size(0),),
+            device=clean.device,
+        )
+        eta = eta_schedule[step_indices].view(
             -1,
             *([1] * (clean.ndim - 1)),
         )
-        noise = torch.randn_like(clean) * self.noise_scale
-        state = t * clean + (1.0 - t) * noise
-        velocity_target = (clean - state) / (1.0 - t).clamp_min(
-            self.t_eps
+        noise = torch.randn_like(clean)
+        state = (
+            clean
+            + eta * (degraded - clean)
+            + self.resshift_kappa * eta.sqrt() * noise
         )
         labels = self._labels(task_ids, clean.size(0), clean.device)
         clean_pred = self.net(
             torch.cat([state, condition], dim=1),
-            t.flatten(),
+            eta.flatten(),
             labels,
         )
-        velocity_pred = (clean_pred - state) / (
-            1.0 - t
-        ).clamp_min(self.t_eps)
+        # ResShift's unweighted x0 MSE is also the MSE between the predicted
+        # and target residual-shifting velocities: (y - x_pred) vs (y - x).
+        velocity_pred = degraded - clean_pred
+        velocity_target = degraded - clean
         flow_loss = (velocity_pred - velocity_target).pow(2).mean()
         l1_loss = (clean_pred - clean).abs().mean()
         self.loss_terms = {
             "flow": flow_loss.detach(),
             "l1": l1_loss.detach(),
+            "eta": eta.mean().detach(),
         }
         return self.lambda_flow * flow_loss + self.lambda_l1 * l1_loss
 
@@ -131,8 +179,8 @@ class AllInOneRestorationDenoiser(nn.Module):
         method = self.method if method is None else method
         if steps < 1:
             raise ValueError("Sampling steps must be positive")
-        if self.generation_strength == 0.0:
-            return degraded.clone()
+        if method != "resshift":
+            raise ValueError("ResShift bridge requires sampling_method='resshift'")
         if initial_noise is None:
             initial_noise = torch.randn(
                 degraded.shape,
@@ -145,73 +193,78 @@ class AllInOneRestorationDenoiser(nn.Module):
             degraded.size(0),
             degraded.device,
         )
-        t_start = 1.0 - self.generation_strength
-        state = (
-            t_start * degraded
-            + self.generation_strength * self.noise_scale * initial_noise
+        eta_schedule = self._eta_schedule(
+            steps,
+            degraded.device,
+            degraded.dtype,
         )
-        timesteps = torch.linspace(
-            t_start,
-            1.0,
-            steps + 1,
-            device=degraded.device,
+        state = self.make_initial_state(
+            degraded,
+            initial_noise,
+            eta_schedule=eta_schedule,
         )
-        timesteps = timesteps.view(-1, 1, 1, 1, 1).expand(
-            -1,
-            degraded.size(0),
-            -1,
-            -1,
-            -1,
-        )
-        for index in range(steps):
-            t = timesteps[index]
-            t_next = timesteps[index + 1]
-            if method == "heun" and index < steps - 1:
-                state = self._heun_step(
-                    state,
-                    degraded,
-                    labels,
-                    t,
-                    t_next,
+        for index in range(steps, 0, -1):
+            eta_t = eta_schedule[index]
+            eta_previous = eta_schedule[index - 1]
+            eta_batch = eta_t.expand(state.size(0))
+            clean_pred = self._predict_clean(
+                state,
+                degraded,
+                labels,
+                eta_batch,
+            )
+            alpha = eta_t - eta_previous
+            state = (
+                (eta_previous / eta_t) * state
+                + (alpha / eta_t) * clean_pred
+            )
+            if index > 1:
+                posterior_variance = (
+                    self.resshift_kappa**2
+                    * (eta_previous / eta_t)
+                    * alpha
                 )
-            elif method in ("euler", "heun"):
-                state = self._euler_step(
-                    state,
-                    degraded,
-                    labels,
-                    t,
-                    t_next,
+                posterior_noise = torch.randn(
+                    state.shape,
+                    device=state.device,
+                    dtype=state.dtype,
+                    generator=generator,
                 )
-            else:
-                raise NotImplementedError(method)
+                state = (
+                    state
+                    + posterior_variance.clamp_min(0).sqrt()
+                    * posterior_noise
+                )
         return state
 
     @torch.no_grad()
-    def _forward_sample(self, state, degraded, labels, t):
-        clean_pred = self.net(
+    def make_initial_state(
+        self,
+        degraded,
+        initial_noise,
+        eta_schedule=None,
+        steps=None,
+    ):
+        if eta_schedule is None:
+            steps = self.steps if steps is None else steps
+            eta_schedule = self._eta_schedule(
+                steps,
+                degraded.device,
+                degraded.dtype,
+            )
+        return (
+            degraded
+            + self.resshift_kappa
+            * eta_schedule[-1].sqrt()
+            * initial_noise
+        )
+
+    @torch.no_grad()
+    def _predict_clean(self, state, degraded, labels, eta):
+        return self.net(
             torch.cat([state, degraded], dim=1),
-            t.flatten(),
+            eta.flatten(),
             labels,
-        )
-        return (clean_pred - state) / (1.0 - t).clamp_min(self.t_eps)
-
-    @torch.no_grad()
-    def _euler_step(self, state, degraded, labels, t, t_next):
-        velocity = self._forward_sample(state, degraded, labels, t)
-        return state + (t_next - t) * velocity
-
-    @torch.no_grad()
-    def _heun_step(self, state, degraded, labels, t, t_next):
-        velocity = self._forward_sample(state, degraded, labels, t)
-        euler = state + (t_next - t) * velocity
-        velocity_next = self._forward_sample(
-            euler,
-            degraded,
-            labels,
-            t_next,
-        )
-        return state + (t_next - t) * 0.5 * (
-            velocity + velocity_next
         )
 
     @staticmethod

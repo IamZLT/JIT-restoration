@@ -32,6 +32,7 @@ import util.lr_sched as lr_sched
 import util.misc as misc
 from data.dataset_utils import AIOTrainDataset, IRBenchmarks
 from denoiser_all_in_one import AllInOneRestorationDenoiser
+from test_restoration import save_panels, tensor_rgb
 from train_restoration import get_args_parser as get_fixed_parser
 
 
@@ -63,6 +64,9 @@ BENCHMARK_TO_MODEL_TASK = {
 def get_args_parser():
     parser = get_fixed_parser()
     parser.description = "Fixed-resolution JiT All-in-One restoration"
+    for action in parser._actions:
+        if action.dest == "sampling_method":
+            action.choices = ["resshift"]
     parser.add_argument(
         "--config",
         default="",
@@ -94,12 +98,26 @@ def get_args_parser():
         type=str,
         help="Optional CBSD68 original_png directory",
     )
+    parser.add_argument("--resshift_steps", default=15, type=int)
+    parser.add_argument("--resshift_kappa", default=0.2, type=float)
+    parser.add_argument(
+        "--resshift_schedule_power",
+        default=0.3,
+        type=float,
+    )
+    parser.add_argument("--resshift_eta_end", default=0.999, type=float)
+    parser.add_argument(
+        "--bridge_type",
+        default="resshift",
+        choices=["resshift"],
+    )
     parser.set_defaults(
         class_num=3,
         img_size=256,
         patch_size=256,
         output_dir="./output/jit_all_in_one",
-        num_sampling_steps=1,
+        num_sampling_steps=15,
+        sampling_method="resshift",
     )
     return parser
 
@@ -115,6 +133,8 @@ def validate_task_order(args):
         raise ValueError(
             "Fixed All-in-One training requires img_size == patch_size"
         )
+    if args.bridge_type != "resshift":
+        raise ValueError("All-in-One training requires bridge_type=resshift")
 
 
 def to_norm(tensor):
@@ -278,6 +298,99 @@ def build_benchmark_loaders(args):
 
 
 @torch.no_grad()
+def save_step_diagnostics(
+    model,
+    degraded,
+    clean,
+    task_ids,
+    benchmark,
+    stem,
+    sample_index,
+    device,
+    args,
+    output_dir,
+):
+    steps = sorted(
+        {
+            int(value)
+            for value in args.diagnostic_steps.split(",")
+            if value.strip()
+        }
+    )
+    if not steps or steps[0] < 1:
+        raise ValueError(
+            "--diagnostic_steps must contain positive integers"
+        )
+    noise_generator = torch.Generator(device=device).manual_seed(
+        args.eval_seed + sample_index
+    )
+    initial_noise = torch.randn(
+        degraded.shape,
+        device=device,
+        dtype=degraded.dtype,
+        generator=noise_generator,
+    )
+    outputs = {}
+    with autocast_context(device):
+        for step_count in steps:
+            reverse_generator = torch.Generator(device=device).manual_seed(
+                args.eval_seed + sample_index + 100000
+            )
+            outputs[step_count] = model.restore(
+                degraded,
+                task_ids,
+                generator=reverse_generator,
+                initial_noise=initial_noise,
+                steps=step_count,
+                method=args.sampling_method,
+            )
+
+    degraded_01 = to_01(degraded)[0]
+    clean_01 = clean[0]
+    input_score = float(
+        psnr_per_image(
+            degraded_01.unsqueeze(0),
+            clean_01.unsqueeze(0),
+        )[0]
+    )
+    noisy_start = model.make_initial_state(
+        degraded,
+        initial_noise,
+        steps=steps[-1],
+    )
+    panels = [
+        (
+            f"{benchmark} LQ | {input_score:.2f} dB",
+            tensor_rgb(degraded_01),
+        ),
+        (
+            f"LQ + noise | kappa={model.resshift_kappa:.2f}",
+            tensor_rgb(to_01(noisy_start)[0]),
+        ),
+    ]
+    for step_count in steps:
+        output = to_01(outputs[step_count])[0]
+        score = float(
+            psnr_per_image(
+                output.unsqueeze(0),
+                clean_01.unsqueeze(0),
+            )[0]
+        )
+        panels.append(
+            (
+                f"{step_count} step | {score:.2f} dB",
+                tensor_rgb(output),
+            )
+        )
+    panels.append(("GT", tensor_rgb(clean_01)))
+    save_panels(
+        panels,
+        output_dir / f"{stem}_steps.png",
+        args.diagnostic_panel_size,
+    )
+
+
+@torch.no_grad()
 def evaluate_benchmark(
     model,
     loader,
@@ -346,6 +459,19 @@ def evaluate_benchmark(
                 benchmark_dir / f"{stem}_epoch{epoch:04d}.png",
                 nrow=3,
             )
+            if index < args.diagnostic_images:
+                save_step_diagnostics(
+                    model,
+                    degraded,
+                    clean,
+                    task_ids,
+                    benchmark,
+                    stem,
+                    index,
+                    device,
+                    args,
+                    benchmark_dir,
+                )
     result = {
         "psnr": float(np.mean(scores)),
         "mae": float(np.mean(maes)),
@@ -443,6 +569,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, args, writer):
             loss=loss_value,
             flow_loss=model.loss_terms["flow"].item(),
             l1_loss=model.loss_terms["l1"].item(),
+            eta=model.loss_terms["eta"].item(),
             lr=optimizer.param_groups[0]["lr"],
         )
         if writer is not None and step % args.log_freq == 0:
@@ -456,6 +583,11 @@ def train_one_epoch(model, loader, optimizer, device, epoch, args, writer):
             writer.add_scalar(
                 "train/l1_loss",
                 model.loss_terms["l1"].item(),
+                progress,
+            )
+            writer.add_scalar(
+                "train/eta",
+                model.loss_terms["eta"].item(),
                 progress,
             )
     logger.synchronize_between_processes()
@@ -509,6 +641,17 @@ def run_training(args):
     resume_path = checkpoint_path(args.resume)
     if resume_path and os.path.isfile(resume_path):
         checkpoint = torch.load(resume_path, map_location="cpu")
+        checkpoint_bridge = getattr(
+            checkpoint.get("args"),
+            "bridge_type",
+            "noise_to_clean",
+        )
+        if checkpoint_bridge != args.bridge_type:
+            raise ValueError(
+                f"Cannot resume {checkpoint_bridge!r} checkpoint with "
+                f"{args.bridge_type!r} training; use --init_checkpoint "
+                "to initialize weights and start a new optimizer run."
+            )
         model.load_state_dict(checkpoint["model"])
         if checkpoint.get("model_ema"):
             model.ema_params = [

@@ -30,11 +30,11 @@ def get_args_parser():
     )
     parser.add_argument("--output_dir", default="./output/aio_test", type=str)
     parser.add_argument("--device", default="cuda", type=str)
-    parser.add_argument("--steps", default=1, type=int)
+    parser.add_argument("--steps", default=15, type=int)
     parser.add_argument(
         "--method",
-        default="euler",
-        choices=["euler", "heun"],
+        default="resshift",
+        choices=["resshift"],
     )
     parser.add_argument("--num_eval_images", default=4, type=int)
     parser.add_argument("--num_workers", default=4, type=int)
@@ -57,6 +57,16 @@ def main(args):
     checkpoint_path = resolve_checkpoint(args.checkpoint)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     train_args = checkpoint["args"]
+    checkpoint_bridge = getattr(
+        train_args,
+        "bridge_type",
+        "noise_to_clean",
+    )
+    if checkpoint_bridge != "resshift":
+        raise ValueError(
+            "This evaluator requires a ResShift-bridge checkpoint; "
+            "old noise-to-clean checkpoints are not sampler-compatible."
+        )
     if list(train_args.de_type) != TASK_ORDER:
         raise ValueError(
             f"Checkpoint task order {train_args.de_type} does not match "
@@ -113,6 +123,8 @@ def main(args):
         "weights": weight_name,
         "steps": args.steps,
         "method": args.method,
+        "bridge_type": model.bridge_type,
+        "resshift_kappa": model.resshift_kappa,
         "evaluation_crop": f"{train_args.img_size}x{train_args.img_size}",
         "results": results,
     }
