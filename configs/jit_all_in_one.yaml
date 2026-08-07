@@ -1,0 +1,62 @@
+# Fixed-resolution JiT All-in-One restoration
+
+# Model
+model: JiT-B/16
+img_size: 256
+patch_size: 256
+class_num: 3
+attn_dropout: 0.0
+proj_dropout: 0.0
+
+# Dataset degradation order.
+# Keep this order: dataset IDs 0/1/2 generate sigma 15/25/50 noise.
+de_type:
+  - denoise_15
+  - denoise_25
+  - denoise_50
+  - derain
+  - dehaze
+data_file_dir: ./datasets
+samples_per_epoch: 6000
+num_workers: 4
+pin_mem: true
+
+# Conditional x-pred flow
+prediction_type: conditional_x
+P_mean: -0.8
+P_std: 0.8
+noise_scale: 1.0
+t_eps: 0.05
+cond_drop_prob: 0.0
+lambda_flow: 1.0
+lambda_l1: 1.0
+generation_strength: 0.6
+
+# Sampling and validation
+sampling_method: euler
+num_sampling_steps: 1
+eval_freq: 5
+num_eval_images: 4
+eval_seed: 1234
+
+# Optimization
+epochs: 100
+warmup_epochs: 2
+batch_size: 8
+lr: 0.0001
+blr: 0.00005
+min_lr: 0.0
+lr_schedule: cosine
+weight_decay: 0.0
+ema_decay: 0.9999
+
+# Runtime and checkpoints
+output_dir: ./output/jit_all_in_one
+resume: ""
+init_checkpoint: ""
+device: cuda
+seed: 0
+save_last_freq: 1
+log_freq: 20
+evaluate_only: false
+timestamp_output: true

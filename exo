@@ -1,0 +1,66 @@
+cd /data2/zlt/code/JiT-restoration
+
+CUDA_VISIBLE_DEVICES=0  python train_restoration.py \
+  --data_file_dir ./datasets \
+  --output_dir ./output/jit_sots_dehaze \
+  --model JiT-B/16 \
+  --img_size 512 --patch_size 512 \
+  --batch_size 2 --epochs 50 \
+  --num_sampling_steps 20 \
+  --eval_freq 5
+
+CUDA_VISIBLE_DEVICES=0 python train_restoration.py \
+  --data_file_dir ./datasets \
+  --output_dir ./output/jit_reside_rectified \
+  --model JiT-B/16 \
+  --img_size 512 \
+  --patch_size 512 \
+  --batch_size 2 \
+  --epochs 50 \
+  --lr 1e-4 \
+  --num_sampling_steps 4 \
+  --eval_freq 5
+
+  CUDA_VISIBLE_DEVICES=7 python train_deraining.py \
+  --data_file_dir ./datasets \
+  --output_dir ./output/jit_rain_rectified \
+  --model JiT-B/16 \
+  --img_size 512 \
+  --patch_size 512 \
+  --batch_size 2 \
+  --epochs 50 \
+  --lr 1e-4 \
+  --num_sampling_steps 4 \
+  --eval_freq 5 \
+  --rain_repeat 10
+
+  CUDA_VISIBLE_DEVICES=0 python train_deraining.py \
+  --data_file_dir ./datasets \
+  --output_dir ./output/jit_rain_conditional_x \
+  --model JiT-B/16 \
+  --img_size 512 \
+  --patch_size 512 \
+  --batch_size 8 \
+  --epochs 100 \
+  --lr 1e-4 \
+  --prediction_type conditional_x \
+  --generation_strength 0.8 \
+  --num_sampling_steps 10
+
+
+  tensorboard \
+  --logdir output/jit_rain_conditional_x/ \
+  --port 60010 \
+
+
+ CUDA_VISIBLE_DEVICES=1 python train_deraining_dynamic.py \
+  --data_file_dir ./datasets \
+  --model JiT-B/16 \
+  --train_sizes 256x256,320x320,384x512,512x384,512x512 \
+  --batch_size 16 \
+  --epochs 100 \
+  --generation_strength 0.8 \
+  --num_sampling_steps 10 
+
+python train_all_in_one.py \
+  --config configs/jit_all_in_one.yaml

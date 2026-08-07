@@ -1,0 +1,26 @@
+# Large datasets, experiment outputs, and local research notes
+/datasets/
+/output/
+/docs/
+/demo/
+
+# Model checkpoints and training logs
+*.pth
+*.pt
+*.ckpt
+events.out.tfevents.*
+*.tmp
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
