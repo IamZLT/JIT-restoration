@@ -50,15 +50,6 @@ BENCHMARKS = [
     "denoise_25",
     "denoise_50",
 ]
-MODEL_TASK_NAMES = ["dehaze", "derain", "denoise"]
-DEGRADATION_TO_MODEL_TASK = torch.tensor([2, 2, 2, 1, 0])
-BENCHMARK_TO_MODEL_TASK = {
-    "dehaze": 0,
-    "derain": 1,
-    "denoise_15": 2,
-    "denoise_25": 2,
-    "denoise_50": 2,
-}
 
 
 def get_args_parser():
@@ -111,8 +102,12 @@ def get_args_parser():
         default="resshift",
         choices=["resshift"],
     )
+    parser.add_argument(
+        "--conditioning_type",
+        default="state_only",
+        choices=["state_only"],
+    )
     parser.set_defaults(
-        class_num=3,
         img_size=256,
         patch_size=256,
         output_dir="./output/jit_all_in_one",
@@ -127,14 +122,16 @@ def validate_task_order(args):
         raise ValueError(
             "--de_type must keep this order: " + " ".join(TASK_ORDER)
         )
-    if args.class_num != len(MODEL_TASK_NAMES):
-        raise ValueError(f"--class_num must be {len(MODEL_TASK_NAMES)}")
     if args.img_size != args.patch_size:
         raise ValueError(
             "Fixed All-in-One training requires img_size == patch_size"
         )
     if args.bridge_type != "resshift":
         raise ValueError("All-in-One training requires bridge_type=resshift")
+    if args.conditioning_type != "state_only":
+        raise ValueError(
+            "All-in-One training requires conditioning_type=state_only"
+        )
 
 
 def to_norm(tensor):
@@ -302,7 +299,6 @@ def save_step_diagnostics(
     model,
     degraded,
     clean,
-    task_ids,
     benchmark,
     stem,
     sample_index,
@@ -331,19 +327,30 @@ def save_step_diagnostics(
         generator=noise_generator,
     )
     outputs = {}
+    trajectory = None
+    trajectory_etas = None
+    trajectory_steps = steps[-1]
     with autocast_context(device):
         for step_count in steps:
             reverse_generator = torch.Generator(device=device).manual_seed(
                 args.eval_seed + sample_index + 100000
             )
-            outputs[step_count] = model.restore(
+            result = model.restore(
                 degraded,
-                task_ids,
                 generator=reverse_generator,
                 initial_noise=initial_noise,
                 steps=step_count,
                 method=args.sampling_method,
+                return_trajectory=step_count == trajectory_steps,
             )
+            if step_count == trajectory_steps:
+                (
+                    outputs[step_count],
+                    trajectory,
+                    trajectory_etas,
+                ) = result
+            else:
+                outputs[step_count] = result
 
     degraded_01 = to_01(degraded)[0]
     clean_01 = clean[0]
@@ -389,6 +396,38 @@ def save_step_diagnostics(
         args.diagnostic_panel_size,
     )
 
+    trajectory_panels = [
+        (
+            f"{benchmark} LQ | {input_score:.2f} dB",
+            tensor_rgb(degraded_01),
+        )
+    ]
+    for reverse_index, (state, eta_value) in enumerate(
+        zip(trajectory, trajectory_etas)
+    ):
+        state_01 = to_01(state)[0]
+        score = float(
+            psnr_per_image(
+                state_01.unsqueeze(0),
+                clean_01.unsqueeze(0),
+            )[0]
+        )
+        label = (
+            f"start eta={eta_value:.3f} | {score:.2f} dB"
+            if reverse_index == 0
+            else (
+                f"r{reverse_index:02d} eta={eta_value:.3f} | "
+                f"{score:.2f} dB"
+            )
+        )
+        trajectory_panels.append((label, tensor_rgb(state_01)))
+    trajectory_panels.append(("GT", tensor_rgb(clean_01)))
+    save_panels(
+        trajectory_panels,
+        output_dir / f"{stem}_trajectory.png",
+        args.diagnostic_panel_size,
+    )
+
 
 @torch.no_grad()
 def evaluate_benchmark(
@@ -430,12 +469,6 @@ def evaluate_benchmark(
                 * sigma
                 / 255.0
             ).clamp(0, 1)
-        task_ids = torch.full(
-            (degraded.size(0),),
-            BENCHMARK_TO_MODEL_TASK[benchmark],
-            dtype=torch.long,
-            device=device,
-        )
         degraded = to_norm(degraded)
         generator = torch.Generator(device=device).manual_seed(
             args.eval_seed + index
@@ -443,7 +476,6 @@ def evaluate_benchmark(
         with autocast_context(device):
             restored = model.restore(
                 degraded,
-                task_ids,
                 generator=generator,
                 steps=args.num_sampling_steps,
                 method=args.sampling_method,
@@ -464,7 +496,6 @@ def evaluate_benchmark(
                     model,
                     degraded,
                     clean,
-                    task_ids,
                     benchmark,
                     stem,
                     index,
@@ -520,8 +551,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, args, writer):
         "lr",
         misc.SmoothedValue(window_size=1, fmt="{value:.6f}"),
     )
-    task_totals = torch.zeros(
-        len(MODEL_TASK_NAMES),
+    degradation_totals = torch.zeros(
+        len(TASK_ORDER),
         dtype=torch.long,
     )
     iterator = logger.log_every(
@@ -550,9 +581,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, args, writer):
         )
         degraded = to_norm(degraded)
         clean = to_norm(clean)
-        task_ids = DEGRADATION_TO_MODEL_TASK.to(device)[degradation_ids]
         with autocast_context(device):
-            loss = model(clean, degraded, task_ids)
+            loss = model(clean, degraded)
         loss_value = loss.item()
         if not math.isfinite(loss_value):
             raise RuntimeError(f"Non-finite loss: {loss_value}")
@@ -561,9 +591,9 @@ def train_one_epoch(model, loader, optimizer, device, epoch, args, writer):
         optimizer.step()
         model.update_ema()
 
-        task_totals += torch.bincount(
-            task_ids.detach().cpu(),
-            minlength=len(MODEL_TASK_NAMES),
+        degradation_totals += torch.bincount(
+            degradation_ids.detach().cpu(),
+            minlength=len(TASK_ORDER),
         )
         logger.update(
             loss=loss_value,
@@ -592,8 +622,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, args, writer):
             )
     logger.synchronize_between_processes()
     print(
-        "Sampled task counts:",
-        dict(zip(MODEL_TASK_NAMES, task_totals.tolist())),
+        "Sampled degradation counts:",
+        dict(zip(TASK_ORDER, degradation_totals.tolist())),
     )
     print("Averaged stats:", logger)
 
@@ -652,6 +682,16 @@ def run_training(args):
                 f"{args.bridge_type!r} training; use --init_checkpoint "
                 "to initialize weights and start a new optimizer run."
             )
+        checkpoint_conditioning = getattr(
+            checkpoint.get("args"),
+            "conditioning_type",
+            "degraded_and_task",
+        )
+        if checkpoint_conditioning != args.conditioning_type:
+            raise ValueError(
+                f"Cannot resume {checkpoint_conditioning!r} checkpoint with "
+                f"{args.conditioning_type!r} conditioning; start a new run."
+            )
         model.load_state_dict(checkpoint["model"])
         if checkpoint.get("model_ema"):
             model.ema_params = [
@@ -672,6 +712,21 @@ def run_training(args):
                 checkpoint_path(args.init_checkpoint),
                 map_location="cpu",
             )
+            checkpoint_args = (
+                checkpoint.get("args")
+                if isinstance(checkpoint, dict)
+                else None
+            )
+            checkpoint_conditioning = getattr(
+                checkpoint_args,
+                "conditioning_type",
+                "degraded_and_task",
+            )
+            if checkpoint_conditioning != args.conditioning_type:
+                raise ValueError(
+                    "Cannot initialize the 3-channel state-only JiT from a "
+                    "6-channel degraded/task-conditioned checkpoint."
+                )
             model.load_state_dict(checkpoint.get("model", checkpoint))
             print(f"Initialized from {args.init_checkpoint}")
         model.ema_params = [

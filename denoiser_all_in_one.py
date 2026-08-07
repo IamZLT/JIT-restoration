@@ -1,4 +1,4 @@
-"""Task-conditioned JiT with a ResShift-style restoration bridge."""
+"""State-only JiT with a ResShift-style restoration bridge."""
 
 import copy
 import math
@@ -15,16 +15,19 @@ class AllInOneRestorationDenoiser(nn.Module):
         super().__init__()
         self.net = JiT_models[args.model](
             input_size=args.img_size,
-            in_channels=6,
+            in_channels=3,
             out_channels=3,
-            num_classes=args.class_num,
+            use_class_condition=False,
             attn_drop=args.attn_dropout,
             proj_drop=args.proj_dropout,
         )
         self.img_size = args.img_size
-        self.num_classes = args.class_num
         self.bridge_type = getattr(args, "bridge_type", "resshift")
-        self.cond_drop_prob = getattr(args, "cond_drop_prob", 0.0)
+        self.conditioning_type = getattr(
+            args,
+            "conditioning_type",
+            "state_only",
+        )
         self.lambda_flow = getattr(args, "lambda_flow", 1.0)
         self.lambda_l1 = getattr(args, "lambda_l1", 1.0)
         self.prediction_type = args.prediction_type
@@ -40,8 +43,10 @@ class AllInOneRestorationDenoiser(nn.Module):
             raise ValueError("All-in-One JiT requires conditional_x")
         if self.bridge_type != "resshift":
             raise ValueError("All-in-One JiT requires bridge_type=resshift")
-        if self.num_classes < 3:
-            raise ValueError("All-in-One JiT requires class_num >= 3")
+        if self.conditioning_type != "state_only":
+            raise ValueError(
+                "All-in-One JiT requires conditioning_type=state_only"
+            )
         if self.resshift_steps < 1:
             raise ValueError("resshift_steps must be positive")
         if self.resshift_kappa <= 0:
@@ -83,43 +88,13 @@ class AllInOneRestorationDenoiser(nn.Module):
         eta = log_eta.exp().to(dtype=dtype)
         return torch.cat([eta.new_zeros(1), eta])
 
-    def _maybe_drop_cond(self, condition):
-        if not self.training or self.cond_drop_prob <= 0:
-            return condition
-        drop = (
-            torch.rand(condition.size(0), device=condition.device)
-            < self.cond_drop_prob
-        )
-        if drop.any():
-            condition = condition.clone()
-            condition[drop] = 0
-        return condition
-
-    @staticmethod
-    def _labels(task_ids, batch_size, device):
-        if task_ids is None:
-            return torch.zeros(batch_size, dtype=torch.long, device=device)
-        task_ids = torch.as_tensor(
-            task_ids,
-            dtype=torch.long,
-            device=device,
-        ).flatten()
-        if task_ids.numel() == 1 and batch_size > 1:
-            task_ids = task_ids.expand(batch_size)
-        if task_ids.numel() != batch_size:
-            raise ValueError(
-                f"Expected {batch_size} task labels, got {task_ids.numel()}"
-            )
-        return task_ids
-
-    def forward(self, clean, degraded, task_ids):
+    def forward(self, clean, degraded):
         if clean.shape != degraded.shape:
             raise ValueError("Clean and degraded tensors must have same shape")
         if clean.shape[-2:] != (self.img_size, self.img_size):
             raise ValueError(
                 f"Training patches must be {self.img_size}x{self.img_size}"
             )
-        condition = self._maybe_drop_cond(degraded)
         eta_schedule = self._eta_schedule(
             self.resshift_steps,
             clean.device,
@@ -141,17 +116,12 @@ class AllInOneRestorationDenoiser(nn.Module):
             + eta * (degraded - clean)
             + self.resshift_kappa * eta.sqrt() * noise
         )
-        labels = self._labels(task_ids, clean.size(0), clean.device)
         clean_pred = self.net(
-            torch.cat([state, condition], dim=1),
+            state,
             eta.flatten(),
-            labels,
         )
-        # ResShift's unweighted x0 MSE is also the MSE between the predicted
-        # and target residual-shifting velocities: (y - x_pred) vs (y - x).
-        velocity_pred = degraded - clean_pred
-        velocity_target = degraded - clean
-        flow_loss = (velocity_pred - velocity_target).pow(2).mean()
+        # Keep the existing unweighted x0 MSE + L1 objective.
+        flow_loss = (clean_pred - clean).pow(2).mean()
         l1_loss = (clean_pred - clean).abs().mean()
         self.loss_terms = {
             "flow": flow_loss.detach(),
@@ -164,11 +134,11 @@ class AllInOneRestorationDenoiser(nn.Module):
     def restore(
         self,
         degraded,
-        task_ids,
         generator=None,
         initial_noise=None,
         steps=None,
         method=None,
+        return_trajectory=False,
     ):
         if degraded.shape[-2:] != (self.img_size, self.img_size):
             raise ValueError(
@@ -188,11 +158,6 @@ class AllInOneRestorationDenoiser(nn.Module):
                 dtype=degraded.dtype,
                 generator=generator,
             )
-        labels = self._labels(
-            task_ids,
-            degraded.size(0),
-            degraded.device,
-        )
         eta_schedule = self._eta_schedule(
             steps,
             degraded.device,
@@ -203,14 +168,16 @@ class AllInOneRestorationDenoiser(nn.Module):
             initial_noise,
             eta_schedule=eta_schedule,
         )
+        trajectory = [state.clone()] if return_trajectory else None
+        trajectory_etas = (
+            [float(eta_schedule[-1])] if return_trajectory else None
+        )
         for index in range(steps, 0, -1):
             eta_t = eta_schedule[index]
             eta_previous = eta_schedule[index - 1]
             eta_batch = eta_t.expand(state.size(0))
             clean_pred = self._predict_clean(
                 state,
-                degraded,
-                labels,
                 eta_batch,
             )
             alpha = eta_t - eta_previous
@@ -235,6 +202,11 @@ class AllInOneRestorationDenoiser(nn.Module):
                     + posterior_variance.clamp_min(0).sqrt()
                     * posterior_noise
                 )
+            if return_trajectory:
+                trajectory.append(state.clone())
+                trajectory_etas.append(float(eta_previous))
+        if return_trajectory:
+            return state, trajectory, trajectory_etas
         return state
 
     @torch.no_grad()
@@ -260,12 +232,8 @@ class AllInOneRestorationDenoiser(nn.Module):
         )
 
     @torch.no_grad()
-    def _predict_clean(self, state, degraded, labels, eta):
-        return self.net(
-            torch.cat([state, degraded], dim=1),
-            eta.flatten(),
-            labels,
-        )
+    def _predict_clean(self, state, eta):
+        return self.net(state, eta.flatten()).clamp(-1, 1)
 
     @staticmethod
     def _tile_positions(length, tile, stride):
@@ -280,7 +248,6 @@ class AllInOneRestorationDenoiser(nn.Module):
     def restore_tiled(
         self,
         degraded,
-        task_ids,
         generator=None,
         steps=None,
         method=None,
@@ -318,8 +285,6 @@ class AllInOneRestorationDenoiser(nn.Module):
         output = torch.zeros_like(padded)
         weight = torch.zeros_like(padded)
         coordinates = [(top, left) for top in rows for left in cols]
-        labels = self._labels(task_ids, 1, padded.device)
-
         for start in range(0, len(coordinates), tile_batch_size):
             current = coordinates[start : start + tile_batch_size]
             tiles = torch.cat(
@@ -348,7 +313,6 @@ class AllInOneRestorationDenoiser(nn.Module):
             )
             restored = self.restore(
                 tiles,
-                labels.expand(len(current)),
                 initial_noise=noise_tiles,
                 steps=steps,
                 method=method,

@@ -67,6 +67,16 @@ def main(args):
             "This evaluator requires a ResShift-bridge checkpoint; "
             "old noise-to-clean checkpoints are not sampler-compatible."
         )
+    checkpoint_conditioning = getattr(
+        train_args,
+        "conditioning_type",
+        "degraded_and_task",
+    )
+    if checkpoint_conditioning != "state_only":
+        raise ValueError(
+            "This evaluator requires a state-only checkpoint without "
+            "degraded-image or task-label network conditioning."
+        )
     if list(train_args.de_type) != TASK_ORDER:
         raise ValueError(
             f"Checkpoint task order {train_args.de_type} does not match "
@@ -124,6 +134,7 @@ def main(args):
         "steps": args.steps,
         "method": args.method,
         "bridge_type": model.bridge_type,
+        "conditioning_type": model.conditioning_type,
         "resshift_kappa": model.resshift_kappa,
         "evaluation_crop": f"{train_args.img_size}x{train_args.img_size}",
         "results": results,

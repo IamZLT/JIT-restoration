@@ -221,7 +221,8 @@ class JiT(nn.Module):
         num_classes=1000,
         bottleneck_dim=128,
         in_context_len=32,
-        in_context_start=8
+        in_context_start=8,
+        use_class_condition=True,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -231,13 +232,18 @@ class JiT(nn.Module):
         self.num_heads = num_heads
         self.hidden_size = hidden_size
         self.input_size = input_size
-        self.in_context_len = in_context_len
+        self.use_class_condition = use_class_condition
+        self.in_context_len = in_context_len if use_class_condition else 0
         self.in_context_start = in_context_start
         self.num_classes = num_classes
 
         # time and class embed
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size)
+        self.y_embedder = (
+            LabelEmbedder(num_classes, hidden_size)
+            if self.use_class_condition
+            else None
+        )
 
         # linear embed
         self.x_embedder = BottleneckPatchEmbed(input_size, patch_size, in_channels, bottleneck_dim, hidden_size, bias=True)
@@ -299,7 +305,8 @@ class JiT(nn.Module):
         nn.init.constant_(self.x_embedder.proj2.bias, 0)
 
         # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        if self.y_embedder is not None:
+            nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
@@ -330,16 +337,22 @@ class JiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y=None):
         """
         x: (N, C, H, W)
         t: (N,)
-        y: (N,)
+        y: optional (N,) class labels
         """
         # class and time embeddings
         t_emb = self.t_embedder(t)
-        y_emb = self.y_embedder(y)
-        c = t_emb + y_emb
+        if self.use_class_condition:
+            if y is None:
+                raise ValueError("Class labels are required for conditional JiT")
+            y_emb = self.y_embedder(y)
+            c = t_emb + y_emb
+        else:
+            y_emb = None
+            c = t_emb
 
         # forward JiT
         x = self.x_embedder(x)

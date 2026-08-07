@@ -4,7 +4,6 @@
 model: JiT-B/16
 img_size: 256
 patch_size: 256
-class_num: 3
 attn_dropout: 0.0
 proj_dropout: 0.0
 
@@ -24,7 +23,7 @@ pin_mem: true
 # JiT x-pred on a degradation-anchored ResShift bridge
 prediction_type: conditional_x
 bridge_type: resshift
-cond_drop_prob: 0.0
+conditioning_type: state_only
 lambda_flow: 1.0
 lambda_l1: 1.0
 resshift_steps: 15
