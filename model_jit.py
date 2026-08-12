@@ -223,6 +223,8 @@ class JiT(nn.Module):
         in_context_len=32,
         in_context_start=8,
         use_class_condition=True,
+        use_observation_branch=False,
+        use_shallow_skip=False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -233,9 +235,17 @@ class JiT(nn.Module):
         self.hidden_size = hidden_size
         self.input_size = input_size
         self.use_class_condition = use_class_condition
-        self.in_context_len = in_context_len if use_class_condition else 0
+        self.use_observation_branch = use_observation_branch
+        self.use_shallow_skip = use_shallow_skip
+        # Keep in-context tokens even without class conditioning.
+        self.in_context_len = in_context_len
         self.in_context_start = in_context_start
         self.num_classes = num_classes
+        if self.use_observation_branch and in_channels != 3:
+            raise ValueError(
+                "Observation-branch JiT expects RGB state/observation "
+                "inputs (in_channels=3)"
+            )
 
         # time and class embed
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -244,13 +254,60 @@ class JiT(nn.Module):
             if self.use_class_condition
             else None
         )
+        if not self.use_class_condition and self.in_context_len > 0:
+            self.register_tokens = nn.Parameter(
+                torch.zeros(1, self.in_context_len, hidden_size)
+            )
+            nn.init.normal_(self.register_tokens, std=0.02)
+        else:
+            self.register_tokens = None
 
-        # linear embed
-        self.x_embedder = BottleneckPatchEmbed(input_size, patch_size, in_channels, bottleneck_dim, hidden_size, bias=True)
+        # Patch embedding: single stream for generation, dual RGB streams for
+        # blind restoration (state xt and fixed observation y).
+        if self.use_observation_branch:
+            self.state_embedder = BottleneckPatchEmbed(
+                input_size,
+                patch_size,
+                3,
+                bottleneck_dim,
+                hidden_size,
+                bias=True,
+            )
+            self.obs_embedder = BottleneckPatchEmbed(
+                input_size,
+                patch_size,
+                3,
+                bottleneck_dim,
+                hidden_size,
+                bias=True,
+            )
+            self.input_fusion = nn.Linear(hidden_size * 2, hidden_size)
+            self.x_embedder = self.state_embedder
+        else:
+            self.state_embedder = None
+            self.obs_embedder = None
+            self.input_fusion = None
+            self.x_embedder = BottleneckPatchEmbed(
+                input_size,
+                patch_size,
+                in_channels,
+                bottleneck_dim,
+                hidden_size,
+                bias=True,
+            )
 
         # use fixed sin-cos embedding
         num_patches = self.x_embedder.num_patches
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+
+        if self.use_shallow_skip:
+            self.shallow_skip = nn.Linear(
+                hidden_size,
+                hidden_size,
+                bias=False,
+            )
+        else:
+            self.shallow_skip = None
 
         # in-context cls token
         if self.in_context_len > 0:
@@ -284,6 +341,13 @@ class JiT(nn.Module):
 
         self.initialize_weights()
 
+    def _init_patch_embed(self, embedder):
+        w1 = embedder.proj1.weight.data
+        nn.init.xavier_uniform_(w1.view([w1.shape[0], -1]))
+        w2 = embedder.proj2.weight.data
+        nn.init.xavier_uniform_(w2.view([w2.shape[0], -1]))
+        nn.init.constant_(embedder.proj2.bias, 0)
+
     def initialize_weights(self):
         # Initialize transformer layers:
         def _basic_init(module):
@@ -298,11 +362,19 @@ class JiT(nn.Module):
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-        w1 = self.x_embedder.proj1.weight.data
-        nn.init.xavier_uniform_(w1.view([w1.shape[0], -1]))
-        w2 = self.x_embedder.proj2.weight.data
-        nn.init.xavier_uniform_(w2.view([w2.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj2.bias, 0)
+        if self.use_observation_branch:
+            self._init_patch_embed(self.state_embedder)
+            self._init_patch_embed(self.obs_embedder)
+        else:
+            self._init_patch_embed(self.x_embedder)
+
+        # Identity-like start for fusion; shallow skip starts at zero so the
+        # network initially matches plain deep JiT features.
+        if self.input_fusion is not None:
+            nn.init.xavier_uniform_(self.input_fusion.weight)
+            nn.init.constant_(self.input_fusion.bias, 0)
+        if self.shallow_skip is not None:
+            nn.init.zeros_(self.shallow_skip.weight)
 
         # Initialize label embedding table:
         if self.y_embedder is not None:
@@ -337,11 +409,12 @@ class JiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y=None):
+    def forward(self, x, t, y=None, observation=None):
         """
-        x: (N, C, H, W)
+        x: (N, C, H, W) clean/state image (or concatenated 6-ch legacy input)
         t: (N,)
-        y: optional (N,) class labels
+        y: optional (N,) class labels for generative JiT
+        observation: optional (N, 3, H, W) degraded observation for restoration
         """
         # class and time embeddings
         t_emb = self.t_embedder(t)
@@ -355,18 +428,42 @@ class JiT(nn.Module):
             c = t_emb
 
         # forward JiT
-        x = self.x_embedder(x)
-        x += self.pos_embed
+        if self.use_observation_branch:
+            if observation is None:
+                raise ValueError(
+                    "observation is required when use_observation_branch=True"
+                )
+            state_tokens = self.state_embedder(x)
+            obs_tokens = self.obs_embedder(observation)
+            x = self.input_fusion(
+                torch.cat([state_tokens, obs_tokens], dim=-1)
+            )
+        else:
+            x = self.x_embedder(x)
+        x = x + self.pos_embed
+        shallow = x if self.shallow_skip is not None else None
 
         for i, block in enumerate(self.blocks):
-            # in-context
+            # in-context: class repeats for generative JiT, shared registers
+            # for blind restoration (no degradation label).
             if self.in_context_len > 0 and i == self.in_context_start:
-                in_context_tokens = y_emb.unsqueeze(1).repeat(1, self.in_context_len, 1)
-                in_context_tokens += self.in_context_posemb
+                if self.use_class_condition:
+                    in_context_tokens = y_emb.unsqueeze(1).repeat(
+                        1, self.in_context_len, 1
+                    )
+                else:
+                    in_context_tokens = self.register_tokens.expand(
+                        x.size(0), -1, -1
+                    )
+                in_context_tokens = (
+                    in_context_tokens + self.in_context_posemb
+                )
                 x = torch.cat([in_context_tokens, x], dim=1)
             x = block(x, c, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext)
 
         x = x[:, self.in_context_len:]
+        if shallow is not None:
+            x = x + self.shallow_skip(shallow)
 
         x = self.final_layer(x, c)
         output = self.unpatchify(x, self.patch_size)
@@ -375,28 +472,82 @@ class JiT(nn.Module):
 
 
 def JiT_B_16(**kwargs):
-    return JiT(depth=12, hidden_size=768, num_heads=12,
-               bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=16, **kwargs)
+    bottleneck_dim = kwargs.pop("bottleneck_dim", 128)
+    return JiT(
+        depth=12,
+        hidden_size=768,
+        num_heads=12,
+        bottleneck_dim=bottleneck_dim,
+        in_context_len=32,
+        in_context_start=4,
+        patch_size=16,
+        **kwargs,
+    )
 
 def JiT_B_32(**kwargs):
-    return JiT(depth=12, hidden_size=768, num_heads=12,
-               bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=32, **kwargs)
+    bottleneck_dim = kwargs.pop("bottleneck_dim", 128)
+    return JiT(
+        depth=12,
+        hidden_size=768,
+        num_heads=12,
+        bottleneck_dim=bottleneck_dim,
+        in_context_len=32,
+        in_context_start=4,
+        patch_size=32,
+        **kwargs,
+    )
 
 def JiT_L_16(**kwargs):
-    return JiT(depth=24, hidden_size=1024, num_heads=16,
-               bottleneck_dim=128, in_context_len=32, in_context_start=8, patch_size=16, **kwargs)
+    bottleneck_dim = kwargs.pop("bottleneck_dim", 128)
+    return JiT(
+        depth=24,
+        hidden_size=1024,
+        num_heads=16,
+        bottleneck_dim=bottleneck_dim,
+        in_context_len=32,
+        in_context_start=8,
+        patch_size=16,
+        **kwargs,
+    )
 
 def JiT_L_32(**kwargs):
-    return JiT(depth=24, hidden_size=1024, num_heads=16,
-               bottleneck_dim=128, in_context_len=32, in_context_start=8, patch_size=32, **kwargs)
+    bottleneck_dim = kwargs.pop("bottleneck_dim", 128)
+    return JiT(
+        depth=24,
+        hidden_size=1024,
+        num_heads=16,
+        bottleneck_dim=bottleneck_dim,
+        in_context_len=32,
+        in_context_start=8,
+        patch_size=32,
+        **kwargs,
+    )
 
 def JiT_H_16(**kwargs):
-    return JiT(depth=32, hidden_size=1280, num_heads=16,
-               bottleneck_dim=256, in_context_len=32, in_context_start=10, patch_size=16, **kwargs)
+    bottleneck_dim = kwargs.pop("bottleneck_dim", 256)
+    return JiT(
+        depth=32,
+        hidden_size=1280,
+        num_heads=16,
+        bottleneck_dim=bottleneck_dim,
+        in_context_len=32,
+        in_context_start=10,
+        patch_size=16,
+        **kwargs,
+    )
 
 def JiT_H_32(**kwargs):
-    return JiT(depth=32, hidden_size=1280, num_heads=16,
-               bottleneck_dim=256, in_context_len=32, in_context_start=10, patch_size=32, **kwargs)
+    bottleneck_dim = kwargs.pop("bottleneck_dim", 256)
+    return JiT(
+        depth=32,
+        hidden_size=1280,
+        num_heads=16,
+        bottleneck_dim=bottleneck_dim,
+        in_context_len=32,
+        in_context_start=10,
+        patch_size=32,
+        **kwargs,
+    )
 
 
 JiT_models = {

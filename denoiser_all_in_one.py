@@ -1,4 +1,4 @@
-"""State-only JiT with a ResShift-style restoration bridge."""
+"""Blind dual-branch JiT with a ResShift restoration bridge."""
 
 import copy
 import math
@@ -17,7 +17,14 @@ class AllInOneRestorationDenoiser(nn.Module):
             input_size=args.img_size,
             in_channels=3,
             out_channels=3,
+            # no rain/haze/noise oracle label
             use_class_condition=False,
+            # separate RGB patch streams for state xt and observation y
+            use_observation_branch=True,
+            # zero-init shallow→final residual for high-frequency details
+            use_shallow_skip=True,
+            # each RGB stream keeps JiT's native 768→128 compression
+            bottleneck_dim=128,
             attn_drop=args.attn_dropout,
             proj_drop=args.proj_dropout,
         )
@@ -26,7 +33,7 @@ class AllInOneRestorationDenoiser(nn.Module):
         self.conditioning_type = getattr(
             args,
             "conditioning_type",
-            "state_only",
+            "state_and_degraded",
         )
         self.lambda_flow = getattr(args, "lambda_flow", 1.0)
         self.lambda_l1 = getattr(args, "lambda_l1", 1.0)
@@ -39,13 +46,15 @@ class AllInOneRestorationDenoiser(nn.Module):
             0.3,
         )
         self.resshift_eta_end = getattr(args, "resshift_eta_end", 0.999)
+        self.hard_eta_mix = getattr(args, "hard_eta_mix", 0.5)
         if self.prediction_type != "conditional_x":
             raise ValueError("All-in-One JiT requires conditional_x")
         if self.bridge_type != "resshift":
             raise ValueError("All-in-One JiT requires bridge_type=resshift")
-        if self.conditioning_type != "state_only":
+        if self.conditioning_type != "state_and_degraded":
             raise ValueError(
-                "All-in-One JiT requires conditioning_type=state_only"
+                "All-in-One JiT requires "
+                "conditioning_type=state_and_degraded"
             )
         if self.resshift_steps < 1:
             raise ValueError("resshift_steps must be positive")
@@ -55,6 +64,8 @@ class AllInOneRestorationDenoiser(nn.Module):
             raise ValueError("resshift_schedule_power must be positive")
         if not 0.0 < self.resshift_eta_end < 1.0:
             raise ValueError("resshift_eta_end must be in (0, 1)")
+        if not 0.0 <= self.hard_eta_mix <= 1.0:
+            raise ValueError("hard_eta_mix must be in [0, 1]")
 
         self.ema_decay = args.ema_decay
         self.ema_params = None
@@ -88,6 +99,30 @@ class AllInOneRestorationDenoiser(nn.Module):
         eta = log_eta.exp().to(dtype=dtype)
         return torch.cat([eta.new_zeros(1), eta])
 
+    def _sample_step_indices(self, batch_size, device):
+        """Mix uniform trajectory coverage with high-η hard states."""
+        eta_schedule = self._eta_schedule(
+            self.resshift_steps,
+            device,
+            torch.float32,
+        )
+        etas = eta_schedule[1:]
+        uniform_prob = torch.ones_like(etas)
+        uniform_prob = uniform_prob / uniform_prob.sum()
+        hard_prob = etas / etas.sum()
+        sample_prob = (
+            (1.0 - self.hard_eta_mix) * uniform_prob
+            + self.hard_eta_mix * hard_prob
+        )
+        return (
+            torch.multinomial(
+                sample_prob,
+                batch_size,
+                replacement=True,
+            )
+            + 1
+        )
+
     def forward(self, clean, degraded):
         if clean.shape != degraded.shape:
             raise ValueError("Clean and degraded tensors must have same shape")
@@ -100,11 +135,9 @@ class AllInOneRestorationDenoiser(nn.Module):
             clean.device,
             clean.dtype,
         )
-        step_indices = torch.randint(
-            1,
-            self.resshift_steps + 1,
-            (clean.size(0),),
-            device=clean.device,
+        step_indices = self._sample_step_indices(
+            clean.size(0),
+            clean.device,
         )
         eta = eta_schedule[step_indices].view(
             -1,
@@ -119,6 +152,7 @@ class AllInOneRestorationDenoiser(nn.Module):
         clean_pred = self.net(
             state,
             eta.flatten(),
+            observation=degraded,
         )
         # Keep the existing unweighted x0 MSE + L1 objective.
         flow_loss = (clean_pred - clean).pow(2).mean()
@@ -178,6 +212,7 @@ class AllInOneRestorationDenoiser(nn.Module):
             eta_batch = eta_t.expand(state.size(0))
             clean_pred = self._predict_clean(
                 state,
+                degraded,
                 eta_batch,
             )
             alpha = eta_t - eta_previous
@@ -232,8 +267,12 @@ class AllInOneRestorationDenoiser(nn.Module):
         )
 
     @torch.no_grad()
-    def _predict_clean(self, state, eta):
-        return self.net(state, eta.flatten()).clamp(-1, 1)
+    def _predict_clean(self, state, degraded, eta):
+        return self.net(
+            state,
+            eta.flatten(),
+            observation=degraded,
+        ).clamp(-1, 1)
 
     @staticmethod
     def _tile_positions(length, tile, stride):

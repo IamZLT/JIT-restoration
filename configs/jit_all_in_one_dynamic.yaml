@@ -1,11 +1,18 @@
-# Fixed-resolution JiT All-in-One restoration
+# Dynamic-resolution JiT All-in-One restoration (Experiment A defaults)
+# Train: multi-scale rectangular crops (task-balanced)
+# Eval/test: full native resolution (pad to ViT patch, then crop back)
+# Bridge: decoupled a_t path + independent b_t noise + deterministic reverse
 
 # Model
 model: JiT-B/16
-img_size: 256
-patch_size: 256
+# img_size/patch_size are unused for cropping; kept for argparse compatibility
+img_size: 512
+patch_size: 512
 attn_dropout: 0.0
 proj_dropout: 0.0
+
+# Multi-scale training crops (each side divisible by ViT patch 16)
+train_sizes: "256x256,320x320,384x384,384x512,512x384,512x512"
 
 # Dataset degradation order.
 # Keep this order: dataset IDs 0/1/2 generate sigma 15/25/50 noise.
@@ -20,22 +27,22 @@ samples_per_epoch: 6000
 num_workers: 4
 pin_mem: true
 
-# JiT x-pred on a degradation-anchored ResShift bridge
+# Decoupled bridge (Experiment A)
 prediction_type: conditional_x
-bridge_type: resshift
+bridge_type: decoupled_bridge
 conditioning_type: state_and_degraded
 lambda_flow: 1.0
 lambda_l1: 1.0
 resshift_steps: 15
-# Pixel tensors are in [-1, 1], so use a smaller perturbation than latent ResShift.
 resshift_kappa: 0.2
 resshift_schedule_power: 0.3
 resshift_eta_end: 0.999
-# 0.5 uniform trajectory + 0.5 high-η hard-state curriculum
 hard_eta_mix: 0.5
+bridge_noise_shared: 0.2
+bridge_noise_terminal: 0.2
 
-# Sampling and validation
-sampling_method: resshift
+# Sampling and native-resolution validation
+sampling_method: deterministic_bridge
 num_sampling_steps: 15
 eval_freq: 5
 num_eval_images: 4
@@ -47,7 +54,7 @@ diagnostic_panel_size: 256
 # Optimization
 epochs: 200
 warmup_epochs: 2
-batch_size: 8
+batch_size: 4
 lr: 0.0001
 blr: 0.00005
 min_lr: 0.0
@@ -56,7 +63,7 @@ weight_decay: 0.0
 ema_decay: 0.9999
 
 # Runtime and checkpoints
-output_dir: ./output/jit_all_in_one
+output_dir: ./output/jit_all_in_one_dynamic_expA
 resume: ""
 init_checkpoint: ""
 device: cuda

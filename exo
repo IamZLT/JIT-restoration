@@ -49,11 +49,11 @@ CUDA_VISIBLE_DEVICES=0 python train_restoration.py \
 
 
   tensorboard \
-  --logdir output/jit_rain_conditional_x/ \
+  --logdir output/jit_all_in_one/ \
   --port 60010 \
 
 
- CUDA_VISIBLE_DEVICES=1 python train_deraining_dynamic.py \
+ CUDA_VISIBLE_DEVICES=6 python train_deraining_dynamic.py \
   --data_file_dir ./datasets \
   --model JiT-B/16 \
   --train_sizes 256x256,320x320,384x512,512x384,512x512 \
@@ -64,3 +64,16 @@ CUDA_VISIBLE_DEVICES=0 python train_restoration.py \
 
 python train_all_in_one.py \
   --config configs/jit_all_in_one.yaml
+
+git push git@github.com:IamZLT/JIT-restoration.git main
+
+CUDA_VISIBLE_DEVICES=0 torchrun \
+  --standalone --nproc_per_node=4 \
+  train_all_in_one.py \
+  --config configs/jit_all_in_one.yaml
+
+
+CUDA_VISIBLE_DEVICES=7 python train_all_in_one_dynamic.py --config configs/jit_all_in_one_dynamic.yaml
+
+CUDA_VISIBLE_DEVICES=6 python -u train_all_in_one_dynamic.py \
+  --config configs/jit_all_in_one_dynamic_expA.yaml
