@@ -77,3 +77,11 @@ CUDA_VISIBLE_DEVICES=7 python train_all_in_one_dynamic.py --config configs/jit_a
 
 CUDA_VISIBLE_DEVICES=6 python -u train_all_in_one_dynamic.py \
   --config configs/jit_all_in_one_dynamic_expA.yaml
+
+
+  CUDA_VISIBLE_DEVICES=7 python -u train_all_in_one_dynamic.py \
+  --diffusion_steps 1000 \
+  --bridge_noise_shared 0.6 \
+  --bridge_noise_terminal 0.2 \
+  --num_sampling_steps 1 \
+  --sampling_method one_step

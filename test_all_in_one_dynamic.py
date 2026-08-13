@@ -32,21 +32,21 @@ def get_args_parser():
     )
     parser.add_argument(
         "--output_dir",
-        default="./output/aio_dynamic_expA_test",
+        default="./output/aio_dynamic_expB_test",
         type=str,
     )
     parser.add_argument("--device", default="cuda", type=str)
-    parser.add_argument("--steps", default=15, type=int)
+    parser.add_argument("--steps", default=1, type=int)
     parser.add_argument(
         "--method",
-        default="deterministic_bridge",
-        choices=["deterministic_bridge"],
+        default="one_step",
+        choices=["one_step"],
     )
     parser.add_argument("--num_eval_images", default=4, type=int)
     parser.add_argument("--diagnostic_images", default=2, type=int)
     parser.add_argument(
         "--diagnostic_steps",
-        default="1,4,15",
+        default="1",
         type=str,
     )
     parser.add_argument("--diagnostic_panel_size", default=256, type=int)
@@ -84,10 +84,14 @@ def main(args):
         "bridge_type",
         "noise_to_clean",
     )
-    if checkpoint_bridge != "decoupled_bridge":
+    if checkpoint_bridge != "global_udbm_bridge":
         raise ValueError(
-            "This evaluator requires an Experiment-A "
-            "decoupled_bridge checkpoint"
+            "This evaluator requires an Experiment-B "
+            "global_udbm_bridge checkpoint"
+        )
+    if args.steps != 1 or args.method != "one_step":
+        raise ValueError(
+            "UDBM one-step evaluation requires --steps 1 --method one_step"
         )
     checkpoint_conditioning = getattr(
         train_args,
@@ -117,11 +121,11 @@ def main(args):
     eval_args.data_file_dir = args.data_file_dir
     eval_args.output_dir = args.output_dir
     eval_args.device = args.device
-    eval_args.num_sampling_steps = args.steps
-    eval_args.sampling_method = args.method
+    eval_args.num_sampling_steps = 1
+    eval_args.sampling_method = "one_step"
     eval_args.num_eval_images = args.num_eval_images
     eval_args.diagnostic_images = args.diagnostic_images
-    eval_args.diagnostic_steps = args.diagnostic_steps
+    eval_args.diagnostic_steps = "1"
     eval_args.diagnostic_panel_size = args.diagnostic_panel_size
     eval_args.num_workers = args.num_workers
     eval_args.eval_seed = args.eval_seed
@@ -155,14 +159,14 @@ def main(args):
         "checkpoint": checkpoint_path,
         "epoch": epoch,
         "weights": weight_name,
-        "steps": args.steps,
-        "method": args.method,
+        "steps": 1,
+        "method": "one_step",
         "bridge_type": model.bridge_type,
         "conditioning_type": model.conditioning_type,
+        "diffusion_steps": model.diffusion_steps,
         "bridge_noise_shared": model.bridge_noise_shared,
         "bridge_noise_terminal": model.bridge_noise_terminal,
-        "bridge_path_start": model.bridge_path_start,
-        "evaluation": "native_resolution_canonical_subsequence",
+        "evaluation": "native_resolution_one_step",
         "results": results,
     }
     with open(
@@ -171,7 +175,7 @@ def main(args):
         encoding="utf-8",
     ) as handle:
         json.dump(summary, handle, indent=2)
-    print(f"Saved dynamic All-in-One Exp-A results to {output_dir}")
+    print(f"Saved dynamic All-in-One Exp-B results to {output_dir}")
 
 
 if __name__ == "__main__":

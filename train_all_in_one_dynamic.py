@@ -43,7 +43,7 @@ def get_args_parser():
     parser.description = "Dynamic-resolution JiT All-in-One restoration"
     for action in parser._actions:
         if action.dest == "sampling_method":
-            action.choices = ["deterministic_bridge"]
+            action.choices = ["one_step"]
     parser.add_argument(
         "--config",
         default="",
@@ -82,10 +82,10 @@ def get_args_parser():
         help="Optional CBSD68 original_png directory",
     )
     parser.add_argument(
-        "--bridge_steps",
-        default=15,
+        "--diffusion_steps",
+        default=1000,
         type=int,
-        help="Number of canonical bridge intervals",
+        help="Training timeline length T; inference stays one-step",
     )
     parser.add_argument(
         "--bridge_noise_shared",
@@ -123,8 +123,9 @@ def get_args_parser():
         img_size=512,
         patch_size=512,
         output_dir="./output/jit_all_in_one_dynamic_expB_udbm_global",
-        num_sampling_steps=15,
-        sampling_method="deterministic_bridge",
+        num_sampling_steps=1,
+        sampling_method="one_step",
+        diagnostic_steps="1",
     )
     return parser
 
@@ -138,21 +139,21 @@ def validate_args(args):
         raise ValueError(
             "Experiment B requires bridge_type=global_udbm_bridge"
         )
-    if args.sampling_method != "deterministic_bridge":
+    if args.sampling_method != "one_step":
         raise ValueError(
-            "Experiment B requires sampling_method=deterministic_bridge"
+            "Experiment B one-step inference requires "
+            "sampling_method=one_step"
         )
     if args.conditioning_type != "state_and_degraded":
         raise ValueError(
             "All-in-One training requires "
             "conditioning_type=state_and_degraded"
         )
-    if args.bridge_steps < 1:
-        raise ValueError("--bridge_steps must be positive")
-    if args.num_sampling_steps > args.bridge_steps:
+    if args.diffusion_steps < 1:
+        raise ValueError("--diffusion_steps must be positive")
+    if args.num_sampling_steps != 1:
         raise ValueError(
-            "--num_sampling_steps cannot exceed --bridge_steps "
-            "(inference uses a subsequence of the trained schedule)"
+            "One-step inference requires num_sampling_steps=1"
         )
 
 
@@ -210,17 +211,7 @@ def save_native_step_diagnostics(
     args,
     output_dir,
 ):
-    steps = sorted(
-        {
-            int(value)
-            for value in args.diagnostic_steps.split(",")
-            if value.strip()
-        }
-    )
-    if not steps or steps[0] < 1:
-        raise ValueError(
-            "--diagnostic_steps must contain positive integers"
-        )
+    """One-step UDBM diagnostics: LQ | x_T | x0_hat | GT."""
     noise_generator = torch.Generator(device=device).manual_seed(
         args.eval_seed + sample_index
     )
@@ -230,36 +221,23 @@ def save_native_step_diagnostics(
         dtype=degraded.dtype,
         generator=noise_generator,
     )
-    outputs = {}
-    trajectory = None
-    trajectory_coeffs = None
-    trajectory_x0 = None
-    trajectory_steps = steps[-1]
+    reverse_generator = torch.Generator(device=device).manual_seed(
+        args.eval_seed + sample_index + 100000
+    )
     with autocast_context(device):
-        for step_count in steps:
-            reverse_generator = torch.Generator(device=device).manual_seed(
-                args.eval_seed + sample_index + 100000
-            )
-            result = model.restore(
+        restored, trajectory, trajectory_coeffs, trajectory_x0 = (
+            model.restore(
                 degraded,
                 generator=reverse_generator,
                 initial_noise=initial_noise,
-                steps=step_count,
+                steps=1,
                 method=args.sampling_method,
-                return_trajectory=step_count == trajectory_steps,
+                return_trajectory=True,
             )
-            if step_count == trajectory_steps:
-                (
-                    outputs[step_count],
-                    trajectory,
-                    trajectory_coeffs,
-                    trajectory_x0,
-                ) = result
-            else:
-                outputs[step_count] = result
-
+        )
     degraded_01 = to_01(degraded)[0]
     clean_01 = clean[0]
+    restored_01 = to_01(restored)[0]
     height, width = degraded.shape[-2:]
     input_score = float(
         psnr_per_image(
@@ -267,42 +245,29 @@ def save_native_step_diagnostics(
             clean_01.unsqueeze(0),
         )[0]
     )
-    noisy_start = model.make_initial_state(
-        degraded,
-        initial_noise,
-        steps=steps[-1],
+    output_score = float(
+        psnr_per_image(
+            restored_01.unsqueeze(0),
+            clean_01.unsqueeze(0),
+        )[0]
     )
-    terminal_b = float(
-        model._canonical_bridge_schedules(
-            degraded.device,
-            degraded.dtype,
-        )[1][-1]
-    )
+    terminal_b = float(model.bridge_noise_terminal)
+    noisy_start = to_01(trajectory[0])[0]
     panels = [
         (
             f"{benchmark} LQ {height}x{width} | {input_score:.2f} dB",
             tensor_rgb(degraded_01),
         ),
         (
-            f"LQ + noise | b_T={terminal_b:.2f}",
-            tensor_rgb(to_01(noisy_start)[0]),
+            f"x_T | b_T={terminal_b:.2f}",
+            tensor_rgb(noisy_start),
         ),
+        (
+            f"1-step x0 | {output_score:.2f} dB",
+            tensor_rgb(restored_01),
+        ),
+        ("GT", tensor_rgb(clean_01)),
     ]
-    for step_count in steps:
-        output = to_01(outputs[step_count])[0]
-        score = float(
-            psnr_per_image(
-                output.unsqueeze(0),
-                clean_01.unsqueeze(0),
-            )[0]
-        )
-        panels.append(
-            (
-                f"{step_count} step | {score:.2f} dB",
-                tensor_rgb(output),
-            )
-        )
-    panels.append(("GT", tensor_rgb(clean_01)))
     save_native_panels(
         panels,
         output_dir / f"{stem}_steps.png",
@@ -318,7 +283,7 @@ def save_native_step_diagnostics(
     for reverse_index, (state, coeffs) in enumerate(
         zip(trajectory, trajectory_coeffs)
     ):
-        a_value, b_value = coeffs
+        t_value, b_value = coeffs
         state_01 = to_01(state)[0]
         score = float(
             psnr_per_image(
@@ -327,12 +292,9 @@ def save_native_step_diagnostics(
             )[0]
         )
         label = (
-            f"start t={a_value:.3f} b={b_value:.3f} | {score:.2f} dB"
+            f"x_T t={t_value:.3f} b={b_value:.3f} | {score:.2f} dB"
             if reverse_index == 0
-            else (
-                f"r{reverse_index:02d} t={a_value:.3f} b={b_value:.3f} | "
-                f"{score:.2f} dB"
-            )
+            else f"x0_hat t={t_value:.3f} | {score:.2f} dB"
         )
         trajectory_panels.append((label, tensor_rgb(state_01)))
     trajectory_panels.append(("GT", tensor_rgb(clean_01)))
@@ -342,33 +304,25 @@ def save_native_step_diagnostics(
         args.diagnostic_panel_size,
     )
 
-    # Track whether multi-step x0 predictions improve along the bridge.
-    x0_panels = [
-        (
-            f"{benchmark} LQ {height}x{width} | {input_score:.2f} dB",
-            tensor_rgb(degraded_01),
-        )
-    ]
-    for reverse_index, (clean_pred, coeffs) in enumerate(
-        zip(trajectory_x0, trajectory_coeffs[:-1])
-    ):
-        a_value, b_value = coeffs
-        pred_01 = to_01(clean_pred)[0]
-        score = float(
-            psnr_per_image(
-                pred_01.unsqueeze(0),
-                clean_01.unsqueeze(0),
-            )[0]
-        )
-        x0_panels.append(
-            (
-                f"x0@{reverse_index + 1:02d} t={a_value:.3f} | {score:.2f} dB",
-                tensor_rgb(pred_01),
-            )
-        )
-    x0_panels.append(("GT", tensor_rgb(clean_01)))
+    x0_01 = to_01(trajectory_x0[0])[0]
+    x0_score = float(
+        psnr_per_image(
+            x0_01.unsqueeze(0),
+            clean_01.unsqueeze(0),
+        )[0]
+    )
     save_native_panels(
-        x0_panels,
+        [
+            (
+                f"{benchmark} LQ {height}x{width} | {input_score:.2f} dB",
+                tensor_rgb(degraded_01),
+            ),
+            (
+                f"x0 from t=1 | {x0_score:.2f} dB",
+                tensor_rgb(x0_01),
+            ),
+            ("GT", tensor_rgb(clean_01)),
+        ],
         output_dir / f"{stem}_x0_trajectory.png",
         args.diagnostic_panel_size,
     )
@@ -552,10 +506,11 @@ def train_one_epoch(
         )
         logger.update(
             loss=loss_value,
-            flow_loss=model_without_ddp.loss_terms["flow"].item(),
+            mse_loss=model_without_ddp.loss_terms["mse"].item(),
             l1_loss=model_without_ddp.loss_terms["l1"].item(),
             t=model_without_ddp.loss_terms["t"].item(),
-            b=model_without_ddp.loss_terms["b"].item(),
+            alpha=model_without_ddp.loss_terms["alpha"].item(),
+            beta=model_without_ddp.loss_terms["beta"].item(),
             lr=optimizer.param_groups[0]["lr"],
             height=height,
             width=width,
@@ -564,8 +519,8 @@ def train_one_epoch(
             progress = int((step / len(loader) + epoch) * 1000)
             writer.add_scalar("train/loss", loss_value, progress)
             writer.add_scalar(
-                "train/flow_loss",
-                model_without_ddp.loss_terms["flow"].item(),
+                "train/mse_loss",
+                model_without_ddp.loss_terms["mse"].item(),
                 progress,
             )
             writer.add_scalar(
@@ -579,8 +534,13 @@ def train_one_epoch(
                 progress,
             )
             writer.add_scalar(
-                "train/b",
-                model_without_ddp.loss_terms["b"].item(),
+                "train/alpha",
+                model_without_ddp.loss_terms["alpha"].item(),
+                progress,
+            )
+            writer.add_scalar(
+                "train/beta",
+                model_without_ddp.loss_terms["beta"].item(),
                 progress,
             )
             writer.add_scalar("train/height", height, progress)
@@ -667,15 +627,6 @@ def run_training(args):
     model_without_ddp = DynamicAllInOneRestorationDenoiser(args).to(device)
     print("Model ready.", flush=True)
     if misc.is_main_process():
-        with torch.no_grad():
-            a_schedule, b_schedule = (
-                model_without_ddp._canonical_bridge_schedules(
-                    device,
-                    torch.float32,
-                )
-            )
-        print("a_schedule =", a_schedule.detach().cpu().tolist(), flush=True)
-        print("b_schedule =", b_schedule.detach().cpu().tolist(), flush=True)
         print(model_without_ddp.describe_bridge_schedule(), flush=True)
     optimizer = torch.optim.AdamW(
         misc.add_weight_decay(model_without_ddp, args.weight_decay),

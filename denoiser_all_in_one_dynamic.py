@@ -1,12 +1,13 @@
 """Blind dual-branch dynamic JiT with a global UDBM-style bridge.
 
-Experiment B: linear HQ→LQ path alpha_t = t, with UDBM-style noise
-beta_t = lambda_b * t(1-t) + lambda_r * t^2, uniform t sampling, and
-deterministic bridge transport.
-
-Inference with fewer than the trained step count uses a subsequence of the
-canonical training (t, beta) schedule, so the network never sees unseen
-pairings.
+Experiment B (one-step inference):
+  Train over the full discrete timeline t in {0,...,T}:
+      x_t = alpha_t * y + gamma_t * x + beta_t * eps
+      alpha_t = tau, gamma_t = 1 - tau, tau = t / T
+      beta_t  = lambda_b * tau(1-tau) + lambda_r * tau^2
+  Infer with a single network call from the terminal state:
+      x_T = y + lambda_r * eps
+      x_hat_0 = f_theta(x_T, tau=1, y)
 
 Native-resolution inputs are padded to a multiple of the ViT patch size,
 restored, then cropped back. Training crops may be any HxW divisible by 16.
@@ -48,7 +49,7 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         self.lambda_flow = getattr(args, "lambda_flow", 1.0)
         self.lambda_l1 = getattr(args, "lambda_l1", 1.0)
         self.prediction_type = args.prediction_type
-        self.bridge_steps = getattr(args, "bridge_steps", 15)
+        self.diffusion_steps = getattr(args, "diffusion_steps", 1000)
         self.bridge_noise_shared = getattr(
             args,
             "bridge_noise_shared",
@@ -70,8 +71,8 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
                 "Dynamic All-in-One JiT requires "
                 "conditioning_type=state_and_degraded"
             )
-        if self.bridge_steps < 1:
-            raise ValueError("bridge_steps must be positive")
+        if self.diffusion_steps < 1:
+            raise ValueError("diffusion_steps must be positive")
         if self.bridge_noise_shared < 0:
             raise ValueError("bridge_noise_shared must be non-negative")
         if self.bridge_noise_terminal < 0:
@@ -82,103 +83,59 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         self.method = args.sampling_method
         self.steps = args.num_sampling_steps
 
-    def _bridge_schedules(self, steps, device, dtype):
-        """Global UDBM-style linear path with decoupled bridge/terminal noise."""
-        tau = torch.linspace(
-            0.0,
-            1.0,
-            steps + 1,
-            device=device,
-            dtype=dtype,
-        )
-        # Linear HQ -> LQ mean path: mu_t = (1 - t) * x + t * y
-        a_schedule = tau.clone()
-        # UDBM-style stochastic schedule:
-        # beta_t = lambda_b * t(1-t) + lambda_r * t^2
-        b_schedule = (
+    def _bridge_coefficients(self, timesteps, ndim, dtype):
+        """Return alpha, gamma, beta, tau for integer timesteps in [0, T]."""
+        tau = timesteps.to(dtype) / float(self.diffusion_steps)
+        alpha = tau
+        gamma = 1.0 - alpha
+        beta = (
             self.bridge_noise_shared * tau * (1.0 - tau)
-            + self.bridge_noise_terminal * tau.pow(2)
+            + self.bridge_noise_terminal * tau.square()
         )
-        return a_schedule, b_schedule
-
-    def _canonical_bridge_schedules(self, device, dtype):
-        """Training schedule of length T+1; source of all inference (t, beta)."""
-        return self._bridge_schedules(
-            self.bridge_steps,
-            device,
-            dtype,
+        shape = (timesteps.shape[0], *([1] * (ndim - 1)))
+        return (
+            alpha.view(shape),
+            gamma.view(shape),
+            beta.view(shape),
+            tau,
         )
 
-    def _subsample_schedule_indices(self, steps):
-        """Pick steps+1 indices from the trained 0..T grid, keeping endpoints."""
-        train_steps = self.bridge_steps
-        if steps < 1:
-            raise ValueError("Sampling steps must be positive")
-        if steps > train_steps:
-            raise ValueError(
-                f"Requested {steps} sampling steps exceeds the trained "
-                f"canonical schedule ({train_steps}). Use a subsequence "
-                "of the training (t, beta) pairs instead of regenerating."
-            )
-        if steps == train_steps:
-            return list(range(train_steps + 1))
-
-        indices = (
-            torch.linspace(0, train_steps, steps + 1)
-            .round()
-            .to(torch.long)
-            .tolist()
-        )
-        indices[0] = 0
-        indices[-1] = train_steps
-        for index in range(1, len(indices)):
-            if indices[index] <= indices[index - 1]:
-                indices[index] = indices[index - 1] + 1
-        if indices[-1] > train_steps:
-            indices[-1] = train_steps
-            for index in range(len(indices) - 2, -1, -1):
-                if indices[index] >= indices[index + 1]:
-                    indices[index] = indices[index + 1] - 1
-        if indices[0] != 0 or indices[-1] != train_steps:
-            raise RuntimeError(
-                f"Failed to build subsequence endpoints: {indices}"
-            )
-        if len(set(indices)) != len(indices):
-            raise RuntimeError(
-                f"Non-unique subsequence indices: {indices}"
-            )
-        return indices
-
-    def _inference_bridge_schedules(self, steps, device, dtype):
-        """Subsequence of the trained (t, beta) schedule for fair multi-step eval."""
-        a_full, b_full = self._canonical_bridge_schedules(device, dtype)
-        indices = self._subsample_schedule_indices(steps)
-        index_tensor = torch.tensor(
-            indices,
+    def _sample_training_timesteps(self, batch_size, device):
+        """Uniformly sample t in {0, 1, ..., T}."""
+        return torch.randint(
+            low=0,
+            high=self.diffusion_steps + 1,
+            size=(batch_size,),
             device=device,
             dtype=torch.long,
         )
-        return a_full[index_tensor], b_full[index_tensor]
 
-    def _sample_step_indices(self, batch_size, device):
-        """Uniformly sample non-zero bridge states t in {1/T, ..., 1}."""
-        return torch.randint(
-            low=1,
-            high=self.bridge_steps + 1,
-            size=(batch_size,),
-            device=device,
-        )
-
-    def describe_bridge_schedule(self):
-        """Human-readable table of the canonical UDBM schedule."""
-        lines = ["step | t     | bridge | relax | beta"]
-        for index in range(self.bridge_steps + 1):
-            time = index / self.bridge_steps
+    def describe_bridge_schedule(self, max_rows=17):
+        """Sparse human-readable table of the UDBM schedule."""
+        lines = [
+            f"diffusion_steps={self.diffusion_steps} "
+            f"lambda_b={self.bridge_noise_shared} "
+            f"lambda_r={self.bridge_noise_terminal}",
+            "step | t     | bridge | relax | beta",
+        ]
+        if self.diffusion_steps + 1 <= max_rows:
+            indices = list(range(self.diffusion_steps + 1))
+        else:
+            indices = (
+                torch.linspace(0, self.diffusion_steps, max_rows)
+                .round()
+                .to(torch.long)
+                .tolist()
+            )
+            indices[0] = 0
+            indices[-1] = self.diffusion_steps
+        for index in indices:
+            time = index / self.diffusion_steps
             bridge = self.bridge_noise_shared * time * (1.0 - time)
             relax = self.bridge_noise_terminal * time * time
             beta = bridge + relax
             lines.append(
-                f"{index:02d}   | "
+                f"{index:04d} | "
                 f"{time:.3f} | "
                 f"{bridge:.3f}  | "
                 f"{relax:.3f} | "
@@ -200,42 +157,36 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
 
     def forward(self, clean, degraded):
         self._validate_training_shape(clean, degraded)
-        a_schedule, b_schedule = self._canonical_bridge_schedules(
-            clean.device,
-            clean.dtype,
-        )
-        step_indices = self._sample_step_indices(
+        timesteps = self._sample_training_timesteps(
             clean.size(0),
             clean.device,
         )
-        t_t = a_schedule[step_indices].view(
-            -1,
-            *([1] * (clean.ndim - 1)),
-        )
-        b_t = b_schedule[step_indices].view(
-            -1,
-            *([1] * (clean.ndim - 1)),
+        alpha_t, gamma_t, beta_t, tau = self._bridge_coefficients(
+            timesteps,
+            clean.ndim,
+            clean.dtype,
         )
         noise = torch.randn_like(clean)
-        state = (
-            (1.0 - t_t) * clean
-            + t_t * degraded
-            + b_t * noise
+        state_t = (
+            alpha_t * degraded
+            + gamma_t * clean
+            + beta_t * noise
         )
         clean_pred = self.net(
-            state,
-            t_t.flatten(),
+            state_t,
+            tau,
             observation=degraded,
         )
-        flow_loss = (clean_pred - clean).pow(2).mean()
+        mse_loss = (clean_pred - clean).square().mean()
         l1_loss = (clean_pred - clean).abs().mean()
         self.loss_terms = {
-            "flow": flow_loss.detach(),
+            "mse": mse_loss.detach(),
             "l1": l1_loss.detach(),
-            "t": t_t.mean().detach(),
-            "b": b_t.mean().detach(),
+            "t": tau.mean().detach(),
+            "alpha": alpha_t.mean().detach(),
+            "beta": beta_t.mean().detach(),
         }
-        return self.lambda_flow * flow_loss + self.lambda_l1 * l1_loss
+        return self.lambda_flow * mse_loss + self.lambda_l1 * l1_loss
 
     def pad_to_patch(self, tensor):
         height, width = tensor.shape[-2:]
@@ -252,6 +203,34 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
             height,
             width,
         )
+
+    @torch.no_grad()
+    def make_initial_state(
+        self,
+        degraded,
+        generator=None,
+        initial_noise=None,
+    ):
+        """Construct the terminal bridge state x_T = y + lambda_r * eps."""
+        if initial_noise is None:
+            initial_noise = torch.randn(
+                degraded.shape,
+                device=degraded.device,
+                dtype=degraded.dtype,
+                generator=generator,
+            )
+        timesteps = torch.full(
+            (degraded.shape[0],),
+            self.diffusion_steps,
+            device=degraded.device,
+            dtype=torch.long,
+        )
+        alpha_t, _, beta_t, _ = self._bridge_coefficients(
+            timesteps,
+            degraded.ndim,
+            degraded.dtype,
+        )
+        return alpha_t * degraded + beta_t * initial_noise
 
     @torch.no_grad()
     def restore(
@@ -300,92 +279,42 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
     ):
         steps = self.steps if steps is None else steps
         method = self.method if method is None else method
-        if steps < 1:
-            raise ValueError("Sampling steps must be positive")
-        if method != "deterministic_bridge":
+        if steps != 1:
             raise ValueError(
-                "Global UDBM bridge requires "
-                "sampling_method='deterministic_bridge'"
+                "UDBM one-step inference requires steps=1"
             )
-        if initial_noise is None:
-            initial_noise = torch.randn(
-                degraded.shape,
-                device=degraded.device,
-                dtype=degraded.dtype,
-                generator=generator,
+        if method != "one_step":
+            raise ValueError(
+                "Global UDBM one-step inference requires "
+                "sampling_method='one_step'"
             )
-        a_schedule, b_schedule = self._inference_bridge_schedules(
-            steps,
-            degraded.device,
-            degraded.dtype,
-        )
-        state = self.make_initial_state(
+        state_t = self.make_initial_state(
             degraded,
-            initial_noise,
-            a_schedule=a_schedule,
-            b_schedule=b_schedule,
+            generator=generator,
+            initial_noise=initial_noise,
         )
-        trajectory = [state.clone()] if return_trajectory else None
-        trajectory_coeffs = (
-            [(float(a_schedule[-1]), float(b_schedule[-1]))]
-            if return_trajectory
-            else None
+        tau_t = torch.ones(
+            degraded.shape[0],
+            device=degraded.device,
+            dtype=degraded.dtype,
         )
-        trajectory_x0 = [] if return_trajectory else None
-        for index in range(steps, 0, -1):
-            a_t = a_schedule[index]
-            b_t = b_schedule[index]
-            a_s = a_schedule[index - 1]
-            b_s = b_schedule[index - 1]
-            time_batch = a_t.expand(state.size(0))
-            clean_pred = self._predict_clean(
-                state,
-                degraded,
-                time_batch,
-            )
-            eps_hat = (
-                state
-                - a_t * degraded
-                - (1.0 - a_t) * clean_pred
-            ) / b_t.clamp_min(1e-6)
-            state = (
-                a_s * degraded
-                + (1.0 - a_s) * clean_pred
-                + b_s * eps_hat
-            )
-            if return_trajectory:
-                trajectory.append(state.clone())
-                trajectory_coeffs.append((float(a_s), float(b_s)))
-                trajectory_x0.append(clean_pred.clone())
-        if return_trajectory:
-            return state, trajectory, trajectory_coeffs, trajectory_x0
-        return state
-
-    @torch.no_grad()
-    def make_initial_state(
-        self,
-        degraded,
-        initial_noise,
-        a_schedule=None,
-        b_schedule=None,
-        steps=None,
-    ):
-        if a_schedule is None or b_schedule is None:
-            steps = self.steps if steps is None else steps
-            a_schedule, b_schedule = self._inference_bridge_schedules(
-                steps,
-                degraded.device,
-                degraded.dtype,
-            )
-        return degraded + b_schedule[-1] * initial_noise
-
-    @torch.no_grad()
-    def _predict_clean(self, state, degraded, time):
-        return self.net(
-            state,
-            time.flatten(),
+        clean_pred = self.net(
+            state_t,
+            tau_t,
             observation=degraded,
-        ).clamp(-1, 1)
+        )
+        restored = clean_pred.clamp(-1.0, 1.0)
+        if return_trajectory:
+            return (
+                restored,
+                [state_t.clone(), restored.clone()],
+                [
+                    (1.0, float(self.bridge_noise_terminal)),
+                    (0.0, 0.0),
+                ],
+                [restored.clone()],
+            )
+        return restored
 
     @torch.no_grad()
     def update_ema(self):
