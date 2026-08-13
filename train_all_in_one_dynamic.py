@@ -81,47 +81,28 @@ def get_args_parser():
         type=str,
         help="Optional CBSD68 original_png directory",
     )
-    parser.add_argument("--resshift_steps", default=15, type=int)
     parser.add_argument(
-        "--resshift_kappa",
-        default=0.2,
-        type=float,
-        help="Deprecated in Experiment A; ignored for path construction",
-    )
-    parser.add_argument(
-        "--resshift_schedule_power",
-        default=0.3,
-        type=float,
-    )
-    parser.add_argument("--resshift_eta_end", default=0.999, type=float)
-    parser.add_argument(
-        "--bridge_path_start",
-        default=0.001,
-        type=float,
-        help="Smallest non-zero a_t on the path schedule (κ-independent)",
-    )
-    parser.add_argument(
-        "--hard_eta_mix",
-        default=0.5,
-        type=float,
-        help="Mixture weight for high-a hard-state timestep sampling",
+        "--bridge_steps",
+        default=15,
+        type=int,
+        help="Number of canonical bridge intervals",
     )
     parser.add_argument(
         "--bridge_noise_shared",
-        default=0.2,
+        default=0.6,
         type=float,
-        help="λ_b for middle bridge noise λ_b τ(1-τ)",
+        help="lambda_b for shared bridge noise lambda_b * t(1-t)",
     )
     parser.add_argument(
         "--bridge_noise_terminal",
         default=0.2,
         type=float,
-        help="λ_r for terminal noise λ_r τ²",
+        help="lambda_r for terminal relaxation lambda_r * t^2",
     )
     parser.add_argument(
         "--bridge_type",
-        default="decoupled_bridge",
-        choices=["decoupled_bridge"],
+        default="global_udbm_bridge",
+        choices=["global_udbm_bridge"],
     )
     parser.add_argument(
         "--conditioning_type",
@@ -141,7 +122,7 @@ def get_args_parser():
     parser.set_defaults(
         img_size=512,
         patch_size=512,
-        output_dir="./output/jit_all_in_one_dynamic_expA",
+        output_dir="./output/jit_all_in_one_dynamic_expB_udbm_global",
         num_sampling_steps=15,
         sampling_method="deterministic_bridge",
     )
@@ -153,18 +134,25 @@ def validate_args(args):
         raise ValueError(
             "--de_type must keep this order: " + " ".join(TASK_ORDER)
         )
-    if args.bridge_type != "decoupled_bridge":
+    if args.bridge_type != "global_udbm_bridge":
         raise ValueError(
-            "Experiment A requires bridge_type=decoupled_bridge"
+            "Experiment B requires bridge_type=global_udbm_bridge"
         )
     if args.sampling_method != "deterministic_bridge":
         raise ValueError(
-            "Experiment A requires sampling_method=deterministic_bridge"
+            "Experiment B requires sampling_method=deterministic_bridge"
         )
     if args.conditioning_type != "state_and_degraded":
         raise ValueError(
             "All-in-One training requires "
             "conditioning_type=state_and_degraded"
+        )
+    if args.bridge_steps < 1:
+        raise ValueError("--bridge_steps must be positive")
+    if args.num_sampling_steps > args.bridge_steps:
+        raise ValueError(
+            "--num_sampling_steps cannot exceed --bridge_steps "
+            "(inference uses a subsequence of the trained schedule)"
         )
 
 
@@ -339,10 +327,10 @@ def save_native_step_diagnostics(
             )[0]
         )
         label = (
-            f"start a={a_value:.3f} b={b_value:.3f} | {score:.2f} dB"
+            f"start t={a_value:.3f} b={b_value:.3f} | {score:.2f} dB"
             if reverse_index == 0
             else (
-                f"r{reverse_index:02d} a={a_value:.3f} b={b_value:.3f} | "
+                f"r{reverse_index:02d} t={a_value:.3f} b={b_value:.3f} | "
                 f"{score:.2f} dB"
             )
         )
@@ -374,7 +362,7 @@ def save_native_step_diagnostics(
         )
         x0_panels.append(
             (
-                f"x0@{reverse_index + 1:02d} a={a_value:.3f} | {score:.2f} dB",
+                f"x0@{reverse_index + 1:02d} t={a_value:.3f} | {score:.2f} dB",
                 tensor_rgb(pred_01),
             )
         )
@@ -566,7 +554,7 @@ def train_one_epoch(
             loss=loss_value,
             flow_loss=model_without_ddp.loss_terms["flow"].item(),
             l1_loss=model_without_ddp.loss_terms["l1"].item(),
-            a=model_without_ddp.loss_terms["a"].item(),
+            t=model_without_ddp.loss_terms["t"].item(),
             b=model_without_ddp.loss_terms["b"].item(),
             lr=optimizer.param_groups[0]["lr"],
             height=height,
@@ -586,8 +574,8 @@ def train_one_epoch(
                 progress,
             )
             writer.add_scalar(
-                "train/a",
-                model_without_ddp.loss_terms["a"].item(),
+                "train/t",
+                model_without_ddp.loss_terms["t"].item(),
                 progress,
             )
             writer.add_scalar(
@@ -678,6 +666,17 @@ def run_training(args):
     print("Creating DynamicAIO model on device...", flush=True)
     model_without_ddp = DynamicAllInOneRestorationDenoiser(args).to(device)
     print("Model ready.", flush=True)
+    if misc.is_main_process():
+        with torch.no_grad():
+            a_schedule, b_schedule = (
+                model_without_ddp._canonical_bridge_schedules(
+                    device,
+                    torch.float32,
+                )
+            )
+        print("a_schedule =", a_schedule.detach().cpu().tolist(), flush=True)
+        print("b_schedule =", b_schedule.detach().cpu().tolist(), flush=True)
+        print(model_without_ddp.describe_bridge_schedule(), flush=True)
     optimizer = torch.optim.AdamW(
         misc.add_weight_decay(model_without_ddp, args.weight_decay),
         lr=args.lr,
