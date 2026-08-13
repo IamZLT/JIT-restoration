@@ -4,6 +4,9 @@ Experiment A: keep the ResShift-style path schedule a_t, but replace the
 bound noise b_t=kappa*sqrt(a_t) with an independent schedule, and replace the
 ResShift stochastic posterior with deterministic bridge transport.
 
+Inference with fewer than the trained step count uses a subsequence of the
+canonical training (a,b) schedule, so the network never sees unseen pairings.
+
 Native-resolution inputs are padded to a multiple of the ViT patch size,
 restored, then cropped back. Training crops may be any HxW divisible by 16.
 """
@@ -42,7 +45,8 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         self.lambda_l1 = getattr(args, "lambda_l1", 1.0)
         self.prediction_type = args.prediction_type
         self.resshift_steps = getattr(args, "resshift_steps", 15)
-        # Kept for a_t path schedule compatibility / old logs only.
+        # Deprecated for Experiment A path construction; kept only so old
+        # argparse/configs do not break. Path start uses bridge_path_start.
         self.resshift_kappa = getattr(args, "resshift_kappa", 0.2)
         self.resshift_schedule_power = getattr(
             args,
@@ -50,6 +54,7 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
             0.3,
         )
         self.resshift_eta_end = getattr(args, "resshift_eta_end", 0.999)
+        self.bridge_path_start = getattr(args, "bridge_path_start", 0.001)
         self.hard_eta_mix = getattr(args, "hard_eta_mix", 0.5)
         self.bridge_noise_shared = getattr(args, "bridge_noise_shared", 0.2)
         self.bridge_noise_terminal = getattr(
@@ -70,12 +75,15 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
             )
         if self.resshift_steps < 1:
             raise ValueError("resshift_steps must be positive")
-        if self.resshift_kappa <= 0:
-            raise ValueError("resshift_kappa must be positive")
         if self.resshift_schedule_power <= 0:
             raise ValueError("resshift_schedule_power must be positive")
         if not 0.0 < self.resshift_eta_end < 1.0:
             raise ValueError("resshift_eta_end must be in (0, 1)")
+        if not 0.0 < self.bridge_path_start < self.resshift_eta_end:
+            raise ValueError(
+                "bridge_path_start must satisfy "
+                "0 < bridge_path_start < resshift_eta_end"
+            )
         if not 0.0 <= self.hard_eta_mix <= 1.0:
             raise ValueError("hard_eta_mix must be in [0, 1]")
         if self.bridge_noise_shared < 0:
@@ -89,11 +97,8 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         self.steps = args.num_sampling_steps
 
     def _eta_schedule(self, steps, device, dtype):
-        """Original ResShift-style path coefficients (used as a_t)."""
-        eta_start = min(
-            (0.04 / self.resshift_kappa) ** 2,
-            0.001,
-        )
+        """ResShift-style path coefficients used as a_t (κ-independent)."""
+        eta_start = self.bridge_path_start
         if steps == 1:
             return torch.tensor(
                 [0.0, self.resshift_eta_end],
@@ -116,7 +121,7 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         return torch.cat([eta.new_zeros(1), eta])
 
     def _bridge_schedules(self, steps, device, dtype):
-        """Return independent path a_t and noise b_t schedules of length T+1."""
+        """Canonical schedules of length steps+1 with independent a_t / b_t."""
         a_schedule = self._eta_schedule(steps, device, dtype).clone()
         # Exact degraded endpoint so train/test share x_T = y + b_T eps.
         a_schedule[-1] = a_schedule.new_tensor(1.0)
@@ -135,10 +140,68 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         b_schedule[0] = b_schedule.new_tensor(0.0)
         return a_schedule, b_schedule
 
+    def _canonical_bridge_schedules(self, device, dtype):
+        """Training schedule of length T+1; source of all inference (a,b)."""
+        return self._bridge_schedules(
+            self.resshift_steps,
+            device,
+            dtype,
+        )
+
+    def _subsample_schedule_indices(self, steps):
+        """Pick steps+1 indices from the trained 0..T grid, keeping endpoints."""
+        train_steps = self.resshift_steps
+        if steps < 1:
+            raise ValueError("Sampling steps must be positive")
+        if steps > train_steps:
+            raise ValueError(
+                f"Requested {steps} sampling steps exceeds the trained "
+                f"canonical schedule ({train_steps}). Use a subsequence "
+                "of the training (a,b) pairs instead of regenerating."
+            )
+        if steps == train_steps:
+            return list(range(train_steps + 1))
+
+        indices = (
+            torch.linspace(0, train_steps, steps + 1)
+            .round()
+            .to(torch.long)
+            .tolist()
+        )
+        indices[0] = 0
+        indices[-1] = train_steps
+        for index in range(1, len(indices)):
+            if indices[index] <= indices[index - 1]:
+                indices[index] = indices[index - 1] + 1
+        if indices[-1] > train_steps:
+            indices[-1] = train_steps
+            for index in range(len(indices) - 2, -1, -1):
+                if indices[index] >= indices[index + 1]:
+                    indices[index] = indices[index + 1] - 1
+        if indices[0] != 0 or indices[-1] != train_steps:
+            raise RuntimeError(
+                f"Failed to build subsequence endpoints: {indices}"
+            )
+        if len(set(indices)) != len(indices):
+            raise RuntimeError(
+                f"Non-unique subsequence indices: {indices}"
+            )
+        return indices
+
+    def _inference_bridge_schedules(self, steps, device, dtype):
+        """Subsequence of the trained (a,b) schedule for fair multi-step eval."""
+        a_full, b_full = self._canonical_bridge_schedules(device, dtype)
+        indices = self._subsample_schedule_indices(steps)
+        index_tensor = torch.tensor(
+            indices,
+            device=device,
+            dtype=torch.long,
+        )
+        return a_full[index_tensor], b_full[index_tensor]
+
     def _sample_step_indices(self, batch_size, device):
         """Keep the previous high-a mixture curriculum on the path schedule."""
-        a_schedule, _ = self._bridge_schedules(
-            self.resshift_steps,
+        a_schedule, _ = self._canonical_bridge_schedules(
             device,
             torch.float32,
         )
@@ -173,8 +236,7 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
 
     def forward(self, clean, degraded):
         self._validate_training_shape(clean, degraded)
-        a_schedule, b_schedule = self._bridge_schedules(
-            self.resshift_steps,
+        a_schedule, b_schedule = self._canonical_bridge_schedules(
             clean.device,
             clean.dtype,
         )
@@ -289,7 +351,7 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
                 dtype=degraded.dtype,
                 generator=generator,
             )
-        a_schedule, b_schedule = self._bridge_schedules(
+        a_schedule, b_schedule = self._inference_bridge_schedules(
             steps,
             degraded.device,
             degraded.dtype,
@@ -347,7 +409,7 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
     ):
         if a_schedule is None or b_schedule is None:
             steps = self.steps if steps is None else steps
-            a_schedule, b_schedule = self._bridge_schedules(
+            a_schedule, b_schedule = self._inference_bridge_schedules(
                 steps,
                 degraded.device,
                 degraded.dtype,

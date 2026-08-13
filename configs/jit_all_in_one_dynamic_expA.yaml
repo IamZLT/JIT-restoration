@@ -33,21 +33,23 @@ conditioning_type: state_and_degraded
 lambda_flow: 1.0
 lambda_l1: 1.0
 resshift_steps: 15
-# Used only to build the a_t path schedule (eta_start), not for b_t.
+# Deprecated: ignored for Experiment A path construction.
 resshift_kappa: 0.2
 resshift_schedule_power: 0.3
 resshift_eta_end: 0.999
+bridge_path_start: 0.001
 hard_eta_mix: 0.5
 bridge_noise_shared: 0.2
 bridge_noise_terminal: 0.2
 
-# Deterministic bridge sampling + native-resolution validation
+# Deterministic bridge sampling + native-resolution validation.
+# Fewer-step diagnostics subsample the trained 15-step (a,b) schedule.
 sampling_method: deterministic_bridge
 num_sampling_steps: 15
 eval_freq: 5
 num_eval_images: 4
 eval_seed: 1234
-diagnostic_steps: 1,4,15
+diagnostic_steps: 1,5,15
 diagnostic_images: 2
 diagnostic_panel_size: 256
 

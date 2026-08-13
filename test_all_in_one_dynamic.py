@@ -161,7 +161,8 @@ def main(args):
         "conditioning_type": model.conditioning_type,
         "bridge_noise_shared": model.bridge_noise_shared,
         "bridge_noise_terminal": model.bridge_noise_terminal,
-        "evaluation": "native_resolution",
+        "bridge_path_start": model.bridge_path_start,
+        "evaluation": "native_resolution_canonical_subsequence",
         "results": results,
     }
     with open(

@@ -82,13 +82,24 @@ def get_args_parser():
         help="Optional CBSD68 original_png directory",
     )
     parser.add_argument("--resshift_steps", default=15, type=int)
-    parser.add_argument("--resshift_kappa", default=0.2, type=float)
+    parser.add_argument(
+        "--resshift_kappa",
+        default=0.2,
+        type=float,
+        help="Deprecated in Experiment A; ignored for path construction",
+    )
     parser.add_argument(
         "--resshift_schedule_power",
         default=0.3,
         type=float,
     )
     parser.add_argument("--resshift_eta_end", default=0.999, type=float)
+    parser.add_argument(
+        "--bridge_path_start",
+        default=0.001,
+        type=float,
+        help="Smallest non-zero a_t on the path schedule (κ-independent)",
+    )
     parser.add_argument(
         "--hard_eta_mix",
         default=0.5,
@@ -274,8 +285,7 @@ def save_native_step_diagnostics(
         steps=steps[-1],
     )
     terminal_b = float(
-        model._bridge_schedules(
-            steps[-1],
+        model._canonical_bridge_schedules(
             degraded.device,
             degraded.dtype,
         )[1][-1]
@@ -352,7 +362,7 @@ def save_native_step_diagnostics(
         )
     ]
     for reverse_index, (clean_pred, coeffs) in enumerate(
-        zip(trajectory_x0, trajectory_coeffs[1:])
+        zip(trajectory_x0, trajectory_coeffs[:-1])
     ):
         a_value, b_value = coeffs
         pred_01 = to_01(clean_pred)[0]

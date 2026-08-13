@@ -37,17 +37,19 @@ resshift_steps: 15
 resshift_kappa: 0.2
 resshift_schedule_power: 0.3
 resshift_eta_end: 0.999
+bridge_path_start: 0.001
 hard_eta_mix: 0.5
 bridge_noise_shared: 0.2
 bridge_noise_terminal: 0.2
 
-# Sampling and native-resolution validation
+# Sampling and native-resolution validation.
+# Fewer-step diagnostics subsample the trained 15-step (a,b) schedule.
 sampling_method: deterministic_bridge
 num_sampling_steps: 15
 eval_freq: 5
 num_eval_images: 4
 eval_seed: 1234
-diagnostic_steps: 1,4,15
+diagnostic_steps: 1,5,15
 diagnostic_images: 2
 diagnostic_panel_size: 256
 
