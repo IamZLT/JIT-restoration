@@ -1,9 +1,8 @@
-# Dynamic-resolution JiT All-in-One — Experiment B (global UDBM, u=0).
+# Experiment B: global UDBM bridge with u=0 (no uncertainty estimator).
 # Exact official schedule when u=0:
 #   beta_tau = 20 * tau * (1 - tau) + tau^2
-# Time index: t in {0,...,T-1}, tau = t / (T-1).
-# Inference: strictly one network call (one_step).
-# This is NOT full uncertainty-aware UDBM (no pixel-wise u=psi(y)).
+# Time index matches UDBM: t in {0,...,T-1}, tau = t / (T-1).
+# Inference is strictly one network call (one_step).
 
 model: JiT-B/16
 img_size: 512

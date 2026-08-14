@@ -1,16 +1,22 @@
-"""Blind dual-branch dynamic JiT with a global UDBM-style bridge.
+"""Blind dual-branch dynamic JiT with a global UDBM bridge (u=0).
 
-Experiment B (one-step inference):
-  Train over the full discrete timeline t in {0,...,T}:
-      x_t = alpha_t * y + gamma_t * x + beta_t * eps
-      alpha_t = tau, gamma_t = 1 - tau, tau = t / T
-      beta_t  = lambda_b * tau(1-tau) + lambda_r * tau^2
-  Infer with a single network call from the terminal state:
-      x_T = y + lambda_r * eps
-      x_hat_0 = f_theta(x_T, tau=1, y)
+Experiment B (one-step inference, no pixel uncertainty yet):
+  Official UDBM schedule with u=0:
+      tau = t / (T - 1),  t in {0,...,T-1}
+      alpha = tau, gamma = 1 - tau
+      beta  = 20 * tau * (1 - tau) + 1 * tau^2
+  Train: sample t uniformly over {0,...,T-1}, predict observation residual
+      r_target = y - x_0
+      x_hat_0 = y - f_theta(x_t, tau, y)
+  Infer: one forward from terminal state
+      x_{T-1} = y + 1 * eps
+      r_hat = f_theta(x_{T-1}, tau=1, y)
+      x_hat_0 = y - r_hat
 
-Native-resolution inputs are padded to a multiple of the ViT patch size,
-restored, then cropped back. Training crops may be any HxW divisible by 16.
+This is the global (u=0) special case of UDBM, not the full uncertainty-aware
+model. bridge_version identifies the exact schedule for checkpoint safety.
+
+Native-resolution inputs are padded to a multiple of the ViT patch size.
 """
 
 import copy
@@ -20,6 +26,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model_jit_aio_dynamic import DynamicAIOJiT_models
+
+BRIDGE_VERSION = "udbm_exact_v1"
 
 
 class DynamicAllInOneRestorationDenoiser(nn.Module):
@@ -41,6 +49,11 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
             "bridge_type",
             "global_udbm_bridge",
         )
+        self.bridge_version = getattr(
+            args,
+            "bridge_version",
+            BRIDGE_VERSION,
+        )
         self.conditioning_type = getattr(
             args,
             "conditioning_type",
@@ -48,17 +61,20 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         )
         self.lambda_flow = getattr(args, "lambda_flow", 1.0)
         self.lambda_l1 = getattr(args, "lambda_l1", 1.0)
+        self.output_parameterization = "observation_residual_v1"
         self.prediction_type = args.prediction_type
         self.diffusion_steps = getattr(args, "diffusion_steps", 1000)
+        # Official UDBM effective coefficients for u=0:
+        # beta = 20*(1+u)*tau*(1-tau) + (1+u)*tau^2
         self.bridge_noise_shared = getattr(
             args,
             "bridge_noise_shared",
-            0.6,
+            20.0,
         )
         self.bridge_noise_terminal = getattr(
             args,
             "bridge_noise_terminal",
-            0.2,
+            1.0,
         )
         if self.prediction_type != "conditional_x":
             raise ValueError("Dynamic All-in-One JiT requires conditional_x")
@@ -66,13 +82,18 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
             raise ValueError(
                 "Experiment B requires bridge_type=global_udbm_bridge"
             )
+        if self.bridge_version != BRIDGE_VERSION:
+            raise ValueError(
+                f"Expected bridge_version={BRIDGE_VERSION!r}, "
+                f"got {self.bridge_version!r}"
+            )
         if self.conditioning_type != "state_and_degraded":
             raise ValueError(
                 "Dynamic All-in-One JiT requires "
                 "conditioning_type=state_and_degraded"
             )
-        if self.diffusion_steps < 1:
-            raise ValueError("diffusion_steps must be positive")
+        if self.diffusion_steps < 2:
+            raise ValueError("diffusion_steps must be >= 2")
         if self.bridge_noise_shared < 0:
             raise ValueError("bridge_noise_shared must be non-negative")
         if self.bridge_noise_terminal < 0:
@@ -83,9 +104,13 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         self.method = args.sampling_method
         self.steps = args.num_sampling_steps
 
+    def _tau_from_timesteps(self, timesteps, dtype):
+        # Official: t in {0,...,T-1}, tau = t / (T-1)
+        return timesteps.to(dtype) / float(self.diffusion_steps - 1)
+
     def _bridge_coefficients(self, timesteps, ndim, dtype):
-        """Return alpha, gamma, beta, tau for integer timesteps in [0, T]."""
-        tau = timesteps.to(dtype) / float(self.diffusion_steps)
+        """Return alpha, gamma, beta, tau for integer timesteps in [0, T-1]."""
+        tau = self._tau_from_timesteps(timesteps, dtype)
         alpha = tau
         gamma = 1.0 - alpha
         beta = (
@@ -101,10 +126,10 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         )
 
     def _sample_training_timesteps(self, batch_size, device):
-        """Uniformly sample t in {0, 1, ..., T}."""
+        """Uniformly sample t in {0, 1, ..., T-1} (official UDBM)."""
         return torch.randint(
             low=0,
-            high=self.diffusion_steps + 1,
+            high=self.diffusion_steps,
             size=(batch_size,),
             device=device,
             dtype=torch.long,
@@ -112,25 +137,28 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
 
     def describe_bridge_schedule(self, max_rows=17):
         """Sparse human-readable table of the UDBM schedule."""
+        last = self.diffusion_steps - 1
         lines = [
+            f"bridge_version={self.bridge_version}",
             f"diffusion_steps={self.diffusion_steps} "
+            f"(t=0..{last})",
             f"lambda_b={self.bridge_noise_shared} "
             f"lambda_r={self.bridge_noise_terminal}",
             "step | t     | bridge | relax | beta",
         ]
-        if self.diffusion_steps + 1 <= max_rows:
-            indices = list(range(self.diffusion_steps + 1))
+        if self.diffusion_steps <= max_rows:
+            indices = list(range(self.diffusion_steps))
         else:
             indices = (
-                torch.linspace(0, self.diffusion_steps, max_rows)
+                torch.linspace(0, last, max_rows)
                 .round()
                 .to(torch.long)
                 .tolist()
             )
             indices[0] = 0
-            indices[-1] = self.diffusion_steps
+            indices[-1] = last
         for index in indices:
-            time = index / self.diffusion_steps
+            time = index / last
             bridge = self.bridge_noise_shared * time * (1.0 - time)
             relax = self.bridge_noise_terminal * time * time
             beta = bridge + relax
@@ -172,21 +200,53 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
             + gamma_t * clean
             + beta_t * noise
         )
-        clean_pred = self.net(
+
+        # Observation residual used by UDBM:
+        # degraded = clean + residual
+        residual_target = degraded - clean
+
+        residual_pred = self.net(
             state_t,
             tau,
             observation=degraded,
         )
-        mse_loss = (clean_pred - clean).square().mean()
-        l1_loss = (clean_pred - clean).abs().mean()
+
+        # Observation-anchored x0 prediction.
+        clean_pred = degraded - residual_pred
+
+        mse_loss = F.mse_loss(
+            residual_pred,
+            residual_target,
+        )
+
+        l1_loss = F.l1_loss(
+            residual_pred,
+            residual_target,
+        )
+
+        reconstruction_mae = (
+            clean_pred - clean
+        ).abs().mean()
+
         self.loss_terms = {
             "mse": mse_loss.detach(),
             "l1": l1_loss.detach(),
+            "reconstruction_mae": reconstruction_mae.detach(),
+            "residual_target_abs": (
+                residual_target.abs().mean().detach()
+            ),
+            "residual_pred_abs": (
+                residual_pred.abs().mean().detach()
+            ),
             "t": tau.mean().detach(),
             "alpha": alpha_t.mean().detach(),
             "beta": beta_t.mean().detach(),
         }
-        return self.lambda_flow * mse_loss + self.lambda_l1 * l1_loss
+
+        return (
+            self.lambda_flow * mse_loss
+            + self.lambda_l1 * l1_loss
+        )
 
     def pad_to_patch(self, tensor):
         height, width = tensor.shape[-2:]
@@ -211,7 +271,7 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         generator=None,
         initial_noise=None,
     ):
-        """Construct the terminal bridge state x_T = y + lambda_r * eps."""
+        """Terminal state at t=T-1: x = y + beta_T * eps with beta_T=1 (u=0)."""
         if initial_noise is None:
             initial_noise = torch.randn(
                 degraded.shape,
@@ -219,9 +279,14 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
                 dtype=degraded.dtype,
                 generator=generator,
             )
+        if initial_noise.shape != degraded.shape:
+            raise ValueError(
+                "initial_noise must match degraded shape "
+                f"{tuple(degraded.shape)}, got {tuple(initial_noise.shape)}"
+            )
         timesteps = torch.full(
             (degraded.shape[0],),
-            self.diffusion_steps,
+            self.diffusion_steps - 1,
             device=degraded.device,
             dtype=torch.long,
         )
@@ -243,8 +308,21 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         return_trajectory=False,
     ):
         padded, original_size = self.pad_to_patch(degraded)
-        if initial_noise is not None:
-            initial_noise, _ = self.pad_to_patch(initial_noise)
+        # Generate / validate noise on the padded grid so eval and diagnostics
+        # share the same x_T when the same padded noise is passed in.
+        if initial_noise is None:
+            initial_noise = torch.randn(
+                padded.shape,
+                device=padded.device,
+                dtype=padded.dtype,
+                generator=generator,
+            )
+        elif initial_noise.shape[-2:] != padded.shape[-2:]:
+            raise ValueError(
+                "initial_noise spatial size must match the patch-padded "
+                f"input {tuple(padded.shape[-2:])}, got "
+                f"{tuple(initial_noise.shape[-2:])}"
+            )
         result = self._restore_padded(
             padded,
             generator=generator,
@@ -298,11 +376,12 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
             device=degraded.device,
             dtype=degraded.dtype,
         )
-        clean_pred = self.net(
+        residual_pred = self.net(
             state_t,
             tau_t,
             observation=degraded,
         )
+        clean_pred = degraded - residual_pred
         restored = clean_pred.clamp(-1.0, 1.0)
         if return_trajectory:
             return (

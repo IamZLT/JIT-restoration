@@ -85,19 +85,25 @@ def get_args_parser():
         "--diffusion_steps",
         default=1000,
         type=int,
-        help="Training timeline length T; inference stays one-step",
+        help="Official UDBM timeline length T with t in {0,...,T-1}",
     )
     parser.add_argument(
         "--bridge_noise_shared",
-        default=0.6,
+        default=20.0,
         type=float,
-        help="lambda_b for shared bridge noise lambda_b * t(1-t)",
+        help="Official UDBM lambda_b for u=0: 20 * tau * (1-tau)",
     )
     parser.add_argument(
         "--bridge_noise_terminal",
-        default=0.2,
+        default=1.0,
         type=float,
-        help="lambda_r for terminal relaxation lambda_r * t^2",
+        help="Official UDBM lambda_r for u=0: 1 * tau^2 so beta_T=1",
+    )
+    parser.add_argument(
+        "--bridge_version",
+        default="udbm_exact_v1",
+        type=str,
+        help="Exact schedule identifier; rejects mismatched checkpoints",
     )
     parser.add_argument(
         "--bridge_type",
@@ -108,6 +114,18 @@ def get_args_parser():
         "--conditioning_type",
         default="state_and_degraded",
         choices=["state_and_degraded"],
+    )
+    parser.add_argument(
+        "--grad_clip",
+        default=1.0,
+        type=float,
+        help="Max grad norm before optimizer step (0 disables clipping)",
+    )
+    parser.add_argument(
+        "--eval_use_ema",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use EMA weights for periodic / evaluate_only validation",
     )
     parser.add_argument("--world_size", default=1, type=int)
     parser.add_argument(
@@ -139,6 +157,10 @@ def validate_args(args):
         raise ValueError(
             "Experiment B requires bridge_type=global_udbm_bridge"
         )
+    if args.bridge_version != "udbm_exact_v1":
+        raise ValueError(
+            "Experiment B requires bridge_version=udbm_exact_v1"
+        )
     if args.sampling_method != "one_step":
         raise ValueError(
             "Experiment B one-step inference requires "
@@ -149,12 +171,89 @@ def validate_args(args):
             "All-in-One training requires "
             "conditioning_type=state_and_degraded"
         )
-    if args.diffusion_steps < 1:
-        raise ValueError("--diffusion_steps must be positive")
+    if args.prediction_type != "conditional_x":
+        raise ValueError("Experiment B requires prediction_type=conditional_x")
+    if args.diffusion_steps < 2:
+        raise ValueError("--diffusion_steps must be >= 2")
     if args.num_sampling_steps != 1:
         raise ValueError(
             "One-step inference requires num_sampling_steps=1"
         )
+    if abs(args.bridge_noise_shared - 20.0) > 1e-8:
+        print(
+            "Warning: bridge_noise_shared != 20.0; "
+            "official UDBM u=0 uses 20.0",
+            flush=True,
+        )
+    if abs(args.bridge_noise_terminal - 1.0) > 1e-8:
+        print(
+            "Warning: bridge_noise_terminal != 1.0; "
+            "official UDBM u=0 uses 1.0",
+            flush=True,
+        )
+
+
+def validate_bridge_checkpoint(checkpoint_args, current_args):
+    """Reject silent resume across incompatible bridge schedules."""
+    required = {
+        "bridge_type": current_args.bridge_type,
+        "bridge_version": current_args.bridge_version,
+        "sampling_method": current_args.sampling_method,
+        "prediction_type": current_args.prediction_type,
+        "conditioning_type": current_args.conditioning_type,
+        "diffusion_steps": current_args.diffusion_steps,
+        "bridge_noise_shared": current_args.bridge_noise_shared,
+        "bridge_noise_terminal": current_args.bridge_noise_terminal,
+    }
+    for key, expected in required.items():
+        actual = getattr(checkpoint_args, key, None)
+        if actual is None:
+            raise ValueError(
+                f"Checkpoint missing {key!r}; refuse resume/init into "
+                f"{current_args.bridge_version!r}"
+            )
+        if isinstance(expected, float):
+            if abs(float(actual) - float(expected)) > 1e-8:
+                raise ValueError(
+                    f"Checkpoint {key}={actual!r} incompatible with "
+                    f"current {expected!r}"
+                )
+        elif actual != expected:
+            raise ValueError(
+                f"Checkpoint {key}={actual!r} incompatible with "
+                f"current {expected!r}"
+            )
+
+    checkpoint_parameterization = getattr(
+        checkpoint_args,
+        "output_parameterization",
+        "direct_clean_v0",
+    )
+    if checkpoint_parameterization != current_args.output_parameterization:
+        raise ValueError(
+            "Checkpoint output parameterization mismatch: "
+            f"{checkpoint_parameterization!r} vs "
+            f"{current_args.output_parameterization!r}"
+        )
+
+
+@torch.no_grad()
+def swap_ema_weights(model, enable):
+    """Temporarily replace online weights with EMA (or restore backup)."""
+    if not enable or model.ema_params is None:
+        return None
+    backup = [parameter.detach().clone() for parameter in model.parameters()]
+    for parameter, ema_parameter in zip(model.parameters(), model.ema_params):
+        parameter.data.copy_(ema_parameter)
+    return backup
+
+
+@torch.no_grad()
+def restore_online_weights(model, backup):
+    if backup is None:
+        return
+    for parameter, saved in zip(model.parameters(), backup):
+        parameter.data.copy_(saved)
 
 
 def to_norm(tensor):
@@ -215,8 +314,9 @@ def save_native_step_diagnostics(
     noise_generator = torch.Generator(device=device).manual_seed(
         args.eval_seed + sample_index
     )
+    padded, _ = model.pad_to_patch(degraded)
     initial_noise = torch.randn(
-        degraded.shape,
+        padded.shape,
         device=device,
         dtype=degraded.dtype,
         generator=noise_generator,
@@ -259,7 +359,7 @@ def save_native_step_diagnostics(
             tensor_rgb(degraded_01),
         ),
         (
-            f"x_T | b_T={terminal_b:.2f}",
+            f"x_T | tau=1.0 | beta_T={terminal_b:.2f}",
             tensor_rgb(noisy_start),
         ),
         (
@@ -496,6 +596,11 @@ def train_one_epoch(
             raise RuntimeError(f"Non-finite loss: {loss_value}")
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if args.grad_clip and args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                args.grad_clip,
+            )
         optimizer.step()
         model_without_ddp.update_ema()
 
@@ -508,6 +613,21 @@ def train_one_epoch(
             loss=loss_value,
             mse_loss=model_without_ddp.loss_terms["mse"].item(),
             l1_loss=model_without_ddp.loss_terms["l1"].item(),
+            reconstruction_mae=(
+                model_without_ddp
+                .loss_terms["reconstruction_mae"]
+                .item()
+            ),
+            residual_target_abs=(
+                model_without_ddp
+                .loss_terms["residual_target_abs"]
+                .item()
+            ),
+            residual_pred_abs=(
+                model_without_ddp
+                .loss_terms["residual_pred_abs"]
+                .item()
+            ),
             t=model_without_ddp.loss_terms["t"].item(),
             alpha=model_without_ddp.loss_terms["alpha"].item(),
             beta=model_without_ddp.loss_terms["beta"].item(),
@@ -543,6 +663,20 @@ def train_one_epoch(
                 model_without_ddp.loss_terms["beta"].item(),
                 progress,
             )
+            writer.add_scalar(
+                "train/reconstruction_mae",
+                model_without_ddp
+                .loss_terms["reconstruction_mae"]
+                .item(),
+                progress,
+            )
+            writer.add_scalar(
+                "train/residual_pred_abs",
+                model_without_ddp
+                .loss_terms["residual_pred_abs"]
+                .item(),
+                progress,
+            )
             writer.add_scalar("train/height", height, progress)
             writer.add_scalar("train/width", width, progress)
     logger.synchronize_between_processes()
@@ -567,6 +701,7 @@ def run_training(args):
     misc.init_distributed_mode(args)
     validate_args(args)
     args.dynamic_resolution = True
+    args.output_parameterization = "observation_residual_v1"
     if args.timestamp_output and not args.resume and not args.evaluate_only:
         timestamp = (
             datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -637,25 +772,16 @@ def run_training(args):
     resume_path = checkpoint_path(args.resume)
     if resume_path and os.path.isfile(resume_path):
         checkpoint = torch.load(resume_path, map_location="cpu")
-        checkpoint_bridge = getattr(
-            checkpoint.get("args"),
-            "bridge_type",
-            "noise_to_clean",
-        )
-        if checkpoint_bridge != args.bridge_type:
+        checkpoint_args = checkpoint.get("args")
+        if checkpoint_args is None:
             raise ValueError(
-                f"Cannot resume {checkpoint_bridge!r} checkpoint with "
-                f"{args.bridge_type!r} training"
+                "Checkpoint missing args; refuse resume into udbm_exact_v1"
             )
-        if not getattr(
-            checkpoint.get("args"),
-            "dynamic_resolution",
-            False,
-        ):
+        validate_bridge_checkpoint(checkpoint_args, args)
+        if not getattr(checkpoint_args, "dynamic_resolution", False):
             raise ValueError(
                 "Cannot resume a fixed-resolution checkpoint into "
-                "dynamic All-in-One training; use --init_checkpoint only "
-                "if weights are already DynamicAIO-compatible."
+                "dynamic All-in-One training"
             )
         model_without_ddp.load_state_dict(checkpoint["model"])
         if checkpoint.get("model_ema"):
@@ -677,6 +803,9 @@ def run_training(args):
                 checkpoint_path(args.init_checkpoint),
                 map_location="cpu",
             )
+            checkpoint_args = checkpoint.get("args")
+            if checkpoint_args is not None:
+                validate_bridge_checkpoint(checkpoint_args, args)
             model_without_ddp.load_state_dict(
                 checkpoint.get("model", checkpoint),
                 strict=False,
@@ -697,14 +826,21 @@ def run_training(args):
 
     if args.evaluate_only:
         if misc.is_main_process():
-            evaluate_all(
+            ema_backup = swap_ema_weights(
                 model_without_ddp,
-                benchmark_loaders,
-                device,
-                args,
-                start_epoch,
-                writer,
+                args.eval_use_ema,
             )
+            try:
+                evaluate_all(
+                    model_without_ddp,
+                    benchmark_loaders,
+                    device,
+                    args,
+                    start_epoch,
+                    writer,
+                )
+            finally:
+                restore_online_weights(model_without_ddp, ema_backup)
         if args.distributed:
             dist.barrier()
         if writer is not None:
@@ -751,14 +887,21 @@ def run_training(args):
                 dist.barrier()
         if epoch % args.eval_freq == 0 or epoch + 1 == args.epochs:
             if misc.is_main_process():
-                evaluate_all(
+                ema_backup = swap_ema_weights(
                     model_without_ddp,
-                    benchmark_loaders,
-                    device,
-                    args,
-                    epoch,
-                    writer,
+                    args.eval_use_ema,
                 )
+                try:
+                    evaluate_all(
+                        model_without_ddp,
+                        benchmark_loaders,
+                        device,
+                        args,
+                        epoch,
+                        writer,
+                    )
+                finally:
+                    restore_online_weights(model_without_ddp, ema_backup)
             if args.distributed:
                 dist.barrier()
         if writer is not None:
