@@ -50,6 +50,25 @@ class DynamicAIOJiT(nn.Module):
         self.use_observation_branch = use_observation_branch
         self.use_shallow_skip = use_shallow_skip
 
+        # Adaptive token depth starts after register tokens are inserted.
+        self.adaptive_depth_start = (
+            in_context_start if in_context_len > 0 else 0
+        )
+        self.num_adaptive_layers = depth - self.adaptive_depth_start
+
+        if self.num_adaptive_layers < 2:
+            raise ValueError(
+                "Adaptive token depth requires at least two adaptive layers"
+            )
+
+        # A-ViT style internal halting:
+        # borrow one existing token channel, without an extra prediction head.
+        #
+        # beta=-4 initially assigns most output weight to deeper layers,
+        # making old checkpoints safer to fine-tune.
+        self.halt_gamma = nn.Parameter(torch.tensor(1.0))
+        self.halt_beta = nn.Parameter(torch.tensor(-4.0))
+
         self.t_embedder = TimestepEmbedder(hidden_size)
         if self.use_observation_branch:
             self.state_embedder = DynamicBottleneckPatchEmbed(
@@ -216,19 +235,29 @@ class DynamicAIOJiT(nn.Module):
             grid_w * patch,
         )
 
-    def forward(self, state, t, observation=None):
+    def forward(
+        self,
+        state,
+        t,
+        observation=None,
+        return_adaptive_info=False,
+    ):
         condition = self.t_embedder(t)
+
         if self.use_observation_branch:
             if observation is None:
                 raise ValueError(
                     "observation is required for dual-branch DynamicAIOJiT"
                 )
+
             state_tokens, grid_size = self.state_embedder(state)
             obs_tokens, obs_grid = self.obs_embedder(observation)
+
             if obs_grid != grid_size:
                 raise ValueError(
                     f"State grid {grid_size} != observation grid {obs_grid}"
                 )
+
             tokens = self.input_fusion(
                 torch.cat([state_tokens, obs_tokens], dim=-1)
             )
@@ -240,20 +269,43 @@ class DynamicAIOJiT(nn.Module):
             tokens.device,
             tokens.dtype,
         )
+
         shallow = tokens if self.shallow_skip is not None else None
+
+        batch_size, patch_count, _ = tokens.shape
+
+        # ACT accumulators only correspond to image patch tokens.
+        adaptive_output = torch.zeros_like(tokens)
+        remaining = torch.ones(
+            batch_size,
+            patch_count,
+            1,
+            device=tokens.device,
+            dtype=tokens.dtype,
+        )
+        expected_depth = torch.zeros_like(remaining)
+
         prefix_tokens = 0
+
         for index, block in enumerate(self.blocks):
-            if self.in_context_len > 0 and index == self.in_context_start:
+            if (
+                self.in_context_len > 0
+                and index == self.in_context_start
+            ):
                 registers = self.register_tokens.expand(
                     tokens.size(0),
                     -1,
                     -1,
                 )
                 tokens = torch.cat(
-                    [registers + self.in_context_posemb, tokens],
+                    [
+                        registers + self.in_context_posemb,
+                        tokens,
+                    ],
                     dim=1,
                 )
                 prefix_tokens = self.in_context_len
+
             tokens = block(
                 tokens,
                 condition,
@@ -262,14 +314,104 @@ class DynamicAIOJiT(nn.Module):
                 prefix_tokens,
             )
 
-        if self.in_context_len > 0:
-            tokens = tokens[:, self.in_context_len :]
+            # Do not begin adaptive depth before register tokens exist.
+            if index < self.adaptive_depth_start:
+                continue
+
+            # Register tokens are excluded from halting.
+            patch_tokens = tokens[:, prefix_tokens:]
+
+            adaptive_index = index - self.adaptive_depth_start
+            is_last_adaptive_layer = (
+                adaptive_index == self.num_adaptive_layers - 1
+            )
+
+            if is_last_adaptive_layer:
+                # Force all remaining probability mass into the last layer,
+                # so that weights for every patch sum exactly to one.
+                layer_weight = remaining
+            else:
+                # Borrow the first token feature dimension.
+                halt_probability = torch.sigmoid(
+                    self.halt_gamma * patch_tokens[..., :1]
+                    + self.halt_beta
+                )
+
+                layer_weight = torch.minimum(
+                    halt_probability,
+                    remaining,
+                )
+
+            adaptive_output = (
+                adaptive_output
+                + layer_weight * patch_tokens
+            )
+
+            relative_depth = (
+                float(adaptive_index + 1)
+                / float(self.num_adaptive_layers)
+            )
+
+            expected_depth = (
+                expected_depth
+                + layer_weight * relative_depth
+            )
+
+            remaining = (
+                remaining - layer_weight
+            ).clamp_min(0.0)
+
+        # Use the ACT-aggregated patch representation instead of only
+        # the final block representation.
+        tokens = adaptive_output
+
         if shallow is not None:
             tokens = tokens + self.shallow_skip(shallow)
-        return self.unpatchify(
+
+        output = self.unpatchify(
             self.final_layer(tokens, condition),
             grid_size,
         )
+
+        if not return_adaptive_info:
+            return output
+
+        min_depth = 1.0 / float(self.num_adaptive_layers)
+
+        # Convert expected adaptive depth to [0, 1].
+        # 0: mostly completed at the first adaptive layer.
+        # 1: mainly depends on the final Transformer layer.
+        difficulty = (
+            (expected_depth - min_depth)
+            / (1.0 - min_depth)
+        ).clamp(0.0, 1.0)
+
+        grid_h, grid_w = grid_size
+        difficulty_map = difficulty.transpose(1, 2).reshape(
+            batch_size,
+            1,
+            grid_h,
+            grid_w,
+        )
+
+        adaptive_info = {
+            # Used to construct ponder loss.
+            "ponder_loss": expected_depth.mean(),
+
+            # Average number of adaptive layers used.
+            "mean_depth": (
+                expected_depth.mean()
+                * self.num_adaptive_layers
+            ),
+
+            # Patch-grid internal mask in [0, 1].
+            "difficulty_map": difficulty_map,
+
+            "difficulty_mean": difficulty.mean(),
+            "difficulty_std": difficulty.std(unbiased=False),
+        }
+
+        return output, adaptive_info
 
 
 def DynamicAIOJiT_B_16(**kwargs):

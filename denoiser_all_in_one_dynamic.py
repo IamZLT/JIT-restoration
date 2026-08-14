@@ -61,6 +61,11 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         )
         self.lambda_flow = getattr(args, "lambda_flow", 1.0)
         self.lambda_l1 = getattr(args, "lambda_l1", 1.0)
+        self.lambda_ponder = getattr(
+            args,
+            "lambda_ponder",
+            1.0e-4,
+        )
         self.output_parameterization = "observation_residual_v1"
         self.prediction_type = args.prediction_type
         self.diffusion_steps = getattr(args, "diffusion_steps", 1000)
@@ -98,6 +103,8 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
             raise ValueError("bridge_noise_shared must be non-negative")
         if self.bridge_noise_terminal < 0:
             raise ValueError("bridge_noise_terminal must be non-negative")
+        if self.lambda_ponder < 0:
+            raise ValueError("lambda_ponder must be non-negative")
 
         self.ema_decay = args.ema_decay
         self.ema_params = None
@@ -205,11 +212,14 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         # degraded = clean + residual
         residual_target = degraded - clean
 
-        residual_pred = self.net(
+        residual_pred, adaptive_info = self.net(
             state_t,
             tau,
             observation=degraded,
+            return_adaptive_info=True,
         )
+
+        ponder_loss = adaptive_info["ponder_loss"]
 
         # Observation-anchored x0 prediction.
         clean_pred = degraded - residual_pred
@@ -231,6 +241,16 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         self.loss_terms = {
             "mse": mse_loss.detach(),
             "l1": l1_loss.detach(),
+            "ponder_loss": ponder_loss.detach(),
+            "adaptive_mean_depth": (
+                adaptive_info["mean_depth"].detach()
+            ),
+            "difficulty_mean": (
+                adaptive_info["difficulty_mean"].detach()
+            ),
+            "difficulty_std": (
+                adaptive_info["difficulty_std"].detach()
+            ),
             "reconstruction_mae": reconstruction_mae.detach(),
             "residual_target_abs": (
                 residual_target.abs().mean().detach()
@@ -246,6 +266,7 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         return (
             self.lambda_flow * mse_loss
             + self.lambda_l1 * l1_loss
+            + self.lambda_ponder * ponder_loss
         )
 
     def pad_to_patch(self, tensor):

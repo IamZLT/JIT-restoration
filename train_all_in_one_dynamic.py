@@ -122,6 +122,12 @@ def get_args_parser():
         help="Max grad norm before optimizer step (0 disables clipping)",
     )
     parser.add_argument(
+        "--lambda_ponder",
+        default=1.0e-4,
+        type=float,
+        help="Weight of internal adaptive-depth ponder loss",
+    )
+    parser.add_argument(
         "--eval_use_ema",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -613,6 +619,24 @@ def train_one_epoch(
             loss=loss_value,
             mse_loss=model_without_ddp.loss_terms["mse"].item(),
             l1_loss=model_without_ddp.loss_terms["l1"].item(),
+            ponder_loss=(
+                model_without_ddp.loss_terms["ponder_loss"].item()
+            ),
+            adaptive_mean_depth=(
+                model_without_ddp
+                .loss_terms["adaptive_mean_depth"]
+                .item()
+            ),
+            difficulty_mean=(
+                model_without_ddp
+                .loss_terms["difficulty_mean"]
+                .item()
+            ),
+            difficulty_std=(
+                model_without_ddp
+                .loss_terms["difficulty_std"]
+                .item()
+            ),
             reconstruction_mae=(
                 model_without_ddp
                 .loss_terms["reconstruction_mae"]
@@ -674,6 +698,32 @@ def train_one_epoch(
                 "train/residual_pred_abs",
                 model_without_ddp
                 .loss_terms["residual_pred_abs"]
+                .item(),
+                progress,
+            )
+            writer.add_scalar(
+                "train/ponder_loss",
+                model_without_ddp.loss_terms["ponder_loss"].item(),
+                progress,
+            )
+            writer.add_scalar(
+                "train/adaptive_mean_depth",
+                model_without_ddp
+                .loss_terms["adaptive_mean_depth"]
+                .item(),
+                progress,
+            )
+            writer.add_scalar(
+                "train/difficulty_mean",
+                model_without_ddp
+                .loss_terms["difficulty_mean"]
+                .item(),
+                progress,
+            )
+            writer.add_scalar(
+                "train/difficulty_std",
+                model_without_ddp
+                .loss_terms["difficulty_std"]
                 .item(),
                 progress,
             )

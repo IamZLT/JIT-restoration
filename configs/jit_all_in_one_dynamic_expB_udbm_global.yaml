@@ -29,6 +29,7 @@ bridge_version: udbm_exact_v1
 conditioning_type: state_and_degraded
 lambda_flow: 1.0
 lambda_l1: 1.0
+lambda_ponder: 0.0001
 diffusion_steps: 1000
 bridge_noise_shared: 20.0
 bridge_noise_terminal: 1.0
