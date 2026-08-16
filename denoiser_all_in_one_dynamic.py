@@ -61,11 +61,6 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         )
         self.lambda_flow = getattr(args, "lambda_flow", 1.0)
         self.lambda_l1 = getattr(args, "lambda_l1", 1.0)
-        self.lambda_ponder = getattr(
-            args,
-            "lambda_ponder",
-            1.0e-4,
-        )
         self.output_parameterization = "observation_residual_v1"
         self.prediction_type = args.prediction_type
         self.diffusion_steps = getattr(args, "diffusion_steps", 1000)
@@ -103,8 +98,6 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
             raise ValueError("bridge_noise_shared must be non-negative")
         if self.bridge_noise_terminal < 0:
             raise ValueError("bridge_noise_terminal must be non-negative")
-        if self.lambda_ponder < 0:
-            raise ValueError("lambda_ponder must be non-negative")
 
         self.ema_decay = args.ema_decay
         self.ema_params = None
@@ -212,27 +205,42 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         # degraded = clean + residual
         residual_target = degraded - clean
 
-        residual_pred, adaptive_info = self.net(
+        residual_pred = self.net(
             state_t,
             tau,
             observation=degraded,
-            return_adaptive_info=True,
         )
-
-        ponder_loss = adaptive_info["ponder_loss"]
 
         # Observation-anchored x0 prediction.
         clean_pred = degraded - residual_pred
 
-        mse_loss = F.mse_loss(
-            residual_pred,
-            residual_target,
+        error = residual_pred - residual_target
+
+        per_sample_mse = error.square().mean(
+            dim=(1, 2, 3)
+        )
+        per_sample_l1 = error.abs().mean(
+            dim=(1, 2, 3)
         )
 
-        l1_loss = F.l1_loss(
-            residual_pred,
-            residual_target,
+        target_scale = (
+            residual_target.detach()
+            .abs()
+            .mean(dim=(1, 2, 3))
+            .clamp_min(2.0 / 255.0)
         )
+
+        # Half normalization: avoids excessively amplifying denoise_15.
+        sample_weight = target_scale.rsqrt()
+        sample_weight = sample_weight / sample_weight.mean()
+
+        mse_loss = (
+            sample_weight * per_sample_mse
+        ).mean()
+
+        l1_loss = (
+            sample_weight * per_sample_l1
+        ).mean()
 
         reconstruction_mae = (
             clean_pred - clean
@@ -241,16 +249,6 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         self.loss_terms = {
             "mse": mse_loss.detach(),
             "l1": l1_loss.detach(),
-            "ponder_loss": ponder_loss.detach(),
-            "adaptive_mean_depth": (
-                adaptive_info["mean_depth"].detach()
-            ),
-            "difficulty_mean": (
-                adaptive_info["difficulty_mean"].detach()
-            ),
-            "difficulty_std": (
-                adaptive_info["difficulty_std"].detach()
-            ),
             "reconstruction_mae": reconstruction_mae.detach(),
             "residual_target_abs": (
                 residual_target.abs().mean().detach()
@@ -266,7 +264,6 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
         return (
             self.lambda_flow * mse_loss
             + self.lambda_l1 * l1_loss
-            + self.lambda_ponder * ponder_loss
         )
 
     def pad_to_patch(self, tensor):
@@ -415,6 +412,54 @@ class DynamicAllInOneRestorationDenoiser(nn.Module):
                 [restored.clone()],
             )
         return restored
+
+    @torch.no_grad()
+    def routing_difficulty_map(
+        self,
+        degraded,
+        generator=None,
+        initial_noise=None,
+    ):
+        """One-step internal routing map at native resolution.
+
+        Returns a [B, 1, H, W] float map in [0, 1] indicating which pixels
+        persistently trigger large internal feature updates across JiT blocks.
+        This is not an externally predicted degradation map; it reflects JiT's
+        own recovery dynamics.
+        """
+        padded, original_size = self.pad_to_patch(degraded)
+        if initial_noise is None:
+            initial_noise = torch.randn(
+                padded.shape,
+                device=padded.device,
+                dtype=padded.dtype,
+                generator=generator,
+            )
+        state_t = self.make_initial_state(
+            padded,
+            generator=generator,
+            initial_noise=initial_noise,
+        )
+        tau_t = torch.ones(
+            padded.shape[0],
+            device=padded.device,
+            dtype=padded.dtype,
+        )
+        _, adaptive_info = self.net(
+            state_t,
+            tau_t,
+            observation=padded,
+            return_adaptive_info=True,
+        )
+        patch_mask = adaptive_info["difficulty_map"]
+        if patch_mask is None:
+            return None
+        height, width = original_size
+        return F.interpolate(
+            patch_mask.float(),
+            size=(height, width),
+            mode="nearest",
+        )
 
     @torch.no_grad()
     def update_ema(self):

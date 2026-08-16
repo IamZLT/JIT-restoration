@@ -35,7 +35,7 @@ from train_all_in_one import (
 )
 from train_restoration import get_args_parser as get_fixed_parser
 from train_restoration_dynamic import save_native_panels
-from test_restoration import tensor_rgb
+from test_restoration import heatmap, tensor_rgb
 
 
 def get_args_parser():
@@ -120,12 +120,6 @@ def get_args_parser():
         default=1.0,
         type=float,
         help="Max grad norm before optimizer step (0 disables clipping)",
-    )
-    parser.add_argument(
-        "--lambda_ponder",
-        default=1.0e-4,
-        type=float,
-        help="Weight of internal adaptive-depth ponder loss",
     )
     parser.add_argument(
         "--eval_use_ema",
@@ -374,6 +368,24 @@ def save_native_step_diagnostics(
         ),
         ("GT", tensor_rgb(clean_01)),
     ]
+    with autocast_context(device):
+        routing_map = model.routing_difficulty_map(
+            degraded,
+            generator=reverse_generator,
+            initial_noise=initial_noise,
+        )
+    if routing_map is not None:
+        routing_strength = float(model.net.routing_logit.detach())
+        routing_map_01 = routing_map[0, 0]
+        routing_mean = float(routing_map_01.mean())
+        routing_std = float(routing_map_01.std(unbiased=False))
+        panels.append(
+            (
+                f"routing | strength={routing_strength:.3f} "
+                f"| mean={routing_mean:.3f} std={routing_std:.3f}",
+                heatmap(routing_map_01),
+            )
+        )
     save_native_panels(
         panels,
         output_dir / f"{stem}_steps.png",
@@ -619,24 +631,6 @@ def train_one_epoch(
             loss=loss_value,
             mse_loss=model_without_ddp.loss_terms["mse"].item(),
             l1_loss=model_without_ddp.loss_terms["l1"].item(),
-            ponder_loss=(
-                model_without_ddp.loss_terms["ponder_loss"].item()
-            ),
-            adaptive_mean_depth=(
-                model_without_ddp
-                .loss_terms["adaptive_mean_depth"]
-                .item()
-            ),
-            difficulty_mean=(
-                model_without_ddp
-                .loss_terms["difficulty_mean"]
-                .item()
-            ),
-            difficulty_std=(
-                model_without_ddp
-                .loss_terms["difficulty_std"]
-                .item()
-            ),
             reconstruction_mae=(
                 model_without_ddp
                 .loss_terms["reconstruction_mae"]
@@ -698,32 +692,6 @@ def train_one_epoch(
                 "train/residual_pred_abs",
                 model_without_ddp
                 .loss_terms["residual_pred_abs"]
-                .item(),
-                progress,
-            )
-            writer.add_scalar(
-                "train/ponder_loss",
-                model_without_ddp.loss_terms["ponder_loss"].item(),
-                progress,
-            )
-            writer.add_scalar(
-                "train/adaptive_mean_depth",
-                model_without_ddp
-                .loss_terms["adaptive_mean_depth"]
-                .item(),
-                progress,
-            )
-            writer.add_scalar(
-                "train/difficulty_mean",
-                model_without_ddp
-                .loss_terms["difficulty_mean"]
-                .item(),
-                progress,
-            )
-            writer.add_scalar(
-                "train/difficulty_std",
-                model_without_ddp
-                .loss_terms["difficulty_std"]
                 .item(),
                 progress,
             )

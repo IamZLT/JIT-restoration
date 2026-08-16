@@ -50,24 +50,19 @@ class DynamicAIOJiT(nn.Module):
         self.use_observation_branch = use_observation_branch
         self.use_shallow_skip = use_shallow_skip
 
-        # Adaptive token depth starts after register tokens are inserted.
-        self.adaptive_depth_start = (
+        # Internal residual routing starts after register tokens are inserted.
+        self.routing_start = (
             in_context_start if in_context_len > 0 else 0
         )
-        self.num_adaptive_layers = depth - self.adaptive_depth_start
 
-        if self.num_adaptive_layers < 2:
-            raise ValueError(
-                "Adaptive token depth requires at least two adaptive layers"
-            )
+        # Maximum modulation is ±20%.
+        self.max_routing_strength = 0.2
 
-        # A-ViT style internal halting:
-        # borrow one existing token channel, without an extra prediction head.
-        #
-        # beta=-4 initially assigns most output weight to deeper layers,
-        # making old checkpoints safer to fine-tune.
-        self.halt_gamma = nn.Parameter(torch.tensor(1.0))
-        self.halt_beta = nn.Parameter(torch.tensor(-4.0))
+        # sigmoid(-3) * 0.2 ≈ 0.0095.
+        # Therefore the initial model is almost identical to the original JiT.
+        self.routing_logit = nn.Parameter(
+            torch.tensor(-3.0)
+        )
 
         self.t_embedder = TimestepEmbedder(hidden_size)
         if self.use_observation_branch:
@@ -272,20 +267,8 @@ class DynamicAIOJiT(nn.Module):
 
         shallow = tokens if self.shallow_skip is not None else None
 
-        batch_size, patch_count, _ = tokens.shape
-
-        # ACT accumulators only correspond to image patch tokens.
-        adaptive_output = torch.zeros_like(tokens)
-        remaining = torch.ones(
-            batch_size,
-            patch_count,
-            1,
-            device=tokens.device,
-            dtype=tokens.dtype,
-        )
-        expected_depth = torch.zeros_like(remaining)
-
         prefix_tokens = 0
+        routing_maps = []
 
         for index, block in enumerate(self.blocks):
             if (
@@ -306,67 +289,111 @@ class DynamicAIOJiT(nn.Module):
                 )
                 prefix_tokens = self.in_context_len
 
-            tokens = block(
-                tokens,
+            tokens_before = tokens
+
+            candidate = block(
+                tokens_before,
                 condition,
                 self.feat_rope,
                 grid_size,
                 prefix_tokens,
             )
 
-            # Do not begin adaptive depth before register tokens exist.
-            if index < self.adaptive_depth_start:
+            if index < self.routing_start:
+                tokens = candidate
                 continue
 
-            # Register tokens are excluded from halting.
-            patch_tokens = tokens[:, prefix_tokens:]
+            old_patch = tokens_before[:, prefix_tokens:]
+            candidate_patch = candidate[:, prefix_tokens:]
 
-            adaptive_index = index - self.adaptive_depth_start
-            is_last_adaptive_layer = (
-                adaptive_index == self.num_adaptive_layers - 1
+            # The actual update produced by this JiT block.
+            patch_delta = candidate_patch - old_patch
+
+            # Calculate in float32 for numerical stability under bfloat16.
+            update_score = (
+                patch_delta.float()
+                .square()
+                .mean(dim=-1, keepdim=True)
+                .add(1.0e-8)
+                .sqrt()
             )
 
-            if is_last_adaptive_layer:
-                # Force all remaining probability mass into the last layer,
-                # so that weights for every patch sum exactly to one.
-                layer_weight = remaining
+            # Normalize inside each image.
+            # This removes global scale differences between haze/noise/rain.
+            score_mean = update_score.mean(
+                dim=1,
+                keepdim=True,
+            )
+            score_std = update_score.std(
+                dim=1,
+                keepdim=True,
+                unbiased=False,
+            ).clamp_min(1.0e-4)
+
+            normalized_score = (
+                update_score - score_mean
+            ) / score_std
+
+            internal_mask = torch.sigmoid(
+                normalized_score
+            ).to(dtype=patch_delta.dtype)
+
+            # Prevent the network from artificially enlarging delta
+            # solely to manipulate the mask.
+            internal_mask = internal_mask.detach()
+
+            routing_strength = (
+                self.max_routing_strength
+                * torch.sigmoid(self.routing_logit)
+            ).to(dtype=patch_delta.dtype)
+
+            routing_scale = 1.0 + routing_strength * (
+                2.0 * internal_mask - 1.0
+            )
+
+            routed_patch = (
+                old_patch
+                + routing_scale * patch_delta
+            )
+
+            # Register tokens always receive the complete block update.
+            if prefix_tokens > 0:
+                tokens = torch.cat(
+                    [
+                        candidate[:, :prefix_tokens],
+                        routed_patch,
+                    ],
+                    dim=1,
+                )
             else:
-                # Borrow the first token feature dimension.
-                halt_probability = torch.sigmoid(
-                    self.halt_gamma * patch_tokens[..., :1]
-                    + self.halt_beta
-                )
+                tokens = routed_patch
 
-                layer_weight = torch.minimum(
-                    halt_probability,
-                    remaining,
-                )
+            routing_maps.append(internal_mask)
 
-            adaptive_output = (
-                adaptive_output
-                + layer_weight * patch_tokens
-            )
-
-            relative_depth = (
-                float(adaptive_index + 1)
-                / float(self.num_adaptive_layers)
-            )
-
-            expected_depth = (
-                expected_depth
-                + layer_weight * relative_depth
-            )
-
-            remaining = (
-                remaining - layer_weight
-            ).clamp_min(0.0)
-
-        # Use the ACT-aggregated patch representation instead of only
-        # the final block representation.
-        tokens = adaptive_output
+        if prefix_tokens > 0:
+            tokens = tokens[:, prefix_tokens:]
 
         if shallow is not None:
             tokens = tokens + self.shallow_skip(shallow)
+
+        if routing_maps:
+            difficulty = torch.stack(
+                routing_maps,
+                dim=0,
+            ).mean(dim=0)
+
+            grid_h, grid_w = grid_size
+            difficulty_map = difficulty.transpose(
+                1,
+                2,
+            ).reshape(
+                tokens.shape[0],
+                1,
+                grid_h,
+                grid_w,
+            )
+        else:
+            difficulty_map = None
 
         output = self.unpatchify(
             self.final_layer(tokens, condition),
@@ -376,42 +403,14 @@ class DynamicAIOJiT(nn.Module):
         if not return_adaptive_info:
             return output
 
-        min_depth = 1.0 / float(self.num_adaptive_layers)
-
-        # Convert expected adaptive depth to [0, 1].
-        # 0: mostly completed at the first adaptive layer.
-        # 1: mainly depends on the final Transformer layer.
-        difficulty = (
-            (expected_depth - min_depth)
-            / (1.0 - min_depth)
-        ).clamp(0.0, 1.0)
-
-        grid_h, grid_w = grid_size
-        difficulty_map = difficulty.transpose(1, 2).reshape(
-            batch_size,
-            1,
-            grid_h,
-            grid_w,
-        )
-
-        adaptive_info = {
-            # Used to construct ponder loss.
-            "ponder_loss": expected_depth.mean(),
-
-            # Average number of adaptive layers used.
-            "mean_depth": (
-                expected_depth.mean()
-                * self.num_adaptive_layers
-            ),
-
-            # Patch-grid internal mask in [0, 1].
+        return output, {
             "difficulty_map": difficulty_map,
-
-            "difficulty_mean": difficulty.mean(),
-            "difficulty_std": difficulty.std(unbiased=False),
+            "routing_strength": routing_strength.detach(),
+            "difficulty_mean": difficulty.mean().detach(),
+            "difficulty_std": (
+                difficulty.std(unbiased=False).detach()
+            ),
         }
-
-        return output, adaptive_info
 
 
 def DynamicAIOJiT_B_16(**kwargs):
